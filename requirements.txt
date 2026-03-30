@@ -1,3 +1,0 @@
-PyQt5>=5.15
-akshare>=1.10
-yfinance>=0.2
