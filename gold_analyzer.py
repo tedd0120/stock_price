@@ -449,11 +449,46 @@ def _extract_anthropic_text(data):
     return '\n'.join(text_parts)
 
 
-def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
-                    prompt_template='', spot_price=0, kline_source=''):
-    """调用 AI 接口进行金价分析，返回分析文本"""
-    prompt = build_analysis_prompt(kline_data, indicators, prompt_template,
-                                   spot_price, kline_source)
+def _normalize_chat_messages(messages):
+    normalized = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = (message.get('role') or 'user').strip() or 'user'
+        content = message.get('content', '')
+        if isinstance(content, (str, list)):
+            normalized_content = content
+        else:
+            normalized_content = str(content)
+        normalized.append({'role': role, 'content': normalized_content})
+    return normalized
+
+
+
+def _split_anthropic_messages(messages):
+    system_parts = []
+    payload_messages = []
+    for message in messages:
+        role = message.get('role', 'user')
+        content = message.get('content', '')
+        if role == 'system':
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        system_parts.append(item.get('text', ''))
+            else:
+                system_parts.append(str(content))
+            continue
+        payload_messages.append({'role': role, 'content': content})
+    return payload_messages, '\n\n'.join(part for part in system_parts if part)
+
+
+
+def analyze_with_ai(api_url, api_key, model, messages):
+    """调用 AI 接口进行多轮消息分析，返回分析文本"""
+    normalized_messages = _normalize_chat_messages(messages)
+    if not normalized_messages:
+        raise ValueError('AI 消息不能为空')
 
     if _is_openrouter(api_url):
         url = f"{api_url.rstrip('/')}/v1/chat/completions"
@@ -461,7 +496,7 @@ def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
         payload = {
             'model': model,
             'max_tokens': 2048,
-            'messages': [{'role': 'user', 'content': prompt}],
+            'messages': normalized_messages,
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
@@ -469,13 +504,19 @@ def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
         text = _extract_openrouter_text(data)
         return text if text else 'AI 未返回有效内容。'
 
+    anthropic_messages, system_text = _split_anthropic_messages(normalized_messages)
+    if not anthropic_messages:
+        raise ValueError('Anthropic 消息不能为空')
+
     url = f"{api_url.rstrip('/')}/v1/messages"
     headers = _build_ai_headers(api_url, api_key)
     payload = {
         'model': model,
         'max_tokens': 2048,
-        'messages': [{'role': 'user', 'content': prompt}],
+        'messages': anthropic_messages,
     }
+    if system_text:
+        payload['system'] = system_text
 
     resp = requests.post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()

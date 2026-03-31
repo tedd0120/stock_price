@@ -2,6 +2,7 @@
 股价悬浮窗 - PyQt5 半透明无边框可拖动窗口
 """
 import datetime
+import html
 import json
 import os
 import sys
@@ -30,7 +31,7 @@ from gold_analyzer import (
     fetch_gold_kline, fetch_london_gold_spot,
     calculate_indicators, analyze_with_ai,
     test_api_connection, get_default_analysis_prompt,
-    normalize_prompt_template
+    normalize_prompt_template, build_analysis_prompt
 )
 
 UI_FONT_FAMILY = 'Microsoft YaHei UI'
@@ -1373,6 +1374,13 @@ class GoldAnalysisDialog(QDialog):
         self._analysis_thread = None
         self._test_thread = None
         self._owner_widget = parent
+        self._chat_messages = []
+        self._analysis_context_message = None
+        self._latest_analysis_markdown = ''
+        self._current_kline_context = None
+        self._request_mode = None
+        self._status_message = ''
+        self._error_message = ''
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1569,6 +1577,20 @@ class GoldAnalysisDialog(QDialog):
         btn_row.addWidget(self._analyze_btn)
         cl.addLayout(btn_row)
 
+        followup_input_style = f"""
+            QPlainTextEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                padding: 6px;
+                font-size: 8pt; {ff}
+            }}
+            QPlainTextEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+
         # --- Tab 区域：分析结果 + 原始数据 ---
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(f"""
@@ -1591,7 +1613,12 @@ class GoldAnalysisDialog(QDialog):
             }}
         """)
 
-        # Tab 1: 分析结果
+        # Tab 1: 对话结果
+        result_tab = QWidget()
+        result_layout = QVBoxLayout(result_tab)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(8)
+
         self._result_browser = QTextBrowser()
         self._result_browser.setOpenExternalLinks(False)
         self._result_browser.setStyleSheet(f"""
@@ -1603,11 +1630,44 @@ class GoldAnalysisDialog(QDialog):
                 font-size: 8.5pt; {ff}
             }}
         """)
-        self._result_browser.setHtml(
-            '<p style="color:' + t['text_muted'] + '; text-align:center; margin-top:60px;">'
-            '点击「开始分析」获取金价分析报告</p>'
-        )
-        self._tabs.addTab(self._result_browser, '📊 分析结果')
+        result_layout.addWidget(self._result_browser, 1)
+
+        self._followup_input = QPlainTextEdit()
+        self._followup_input.setPlaceholderText('首轮分析完成后，可在这里继续追问')
+        self._followup_input.setFixedHeight(82)
+        self._followup_input.setStyleSheet(followup_input_style)
+        self._followup_input.setEnabled(False)
+        result_layout.addWidget(self._followup_input)
+
+        followup_row = QHBoxLayout()
+        followup_row.addStretch()
+        self._send_btn = QPushButton('发送')
+        self._send_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._send_btn.setFixedWidth(80)
+        self._send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['accent']}; color: #ffffff;
+                border: none; border-radius: 5px; padding: 6px;
+                font-size: 8.5pt; font-weight: 600; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['accent_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {t['accent_pressed']};
+            }}
+            QPushButton:disabled {{
+                background-color: {t['surface']}; color: {t['text_muted']};
+            }}
+        """)
+        self._send_btn.setEnabled(False)
+        self._send_btn.clicked.connect(self._send_followup)
+        self._followup_input.textChanged.connect(self._update_send_button_state)
+        followup_row.addWidget(self._send_btn)
+        result_layout.addLayout(followup_row)
+
+        self._tabs.addTab(result_tab, '💬 分析对话')
+        self._render_chat_history()
 
         # Tab 2: 原始数据
         self._raw_browser = QTextBrowser()
@@ -1753,6 +1813,89 @@ class GoldAnalysisDialog(QDialog):
 
     # --- 分析逻辑 ---
 
+    def _build_result_placeholder(self, text, color=None):
+        color = color or self.theme_tokens['text_muted']
+        return (
+            '<p style="color:' + color + '; text-align:center; margin-top:60px;">'
+            + html.escape(text) + '</p>'
+        )
+
+    def _reset_chat_session(self):
+        self._chat_messages = []
+        self._analysis_context_message = None
+        self._latest_analysis_markdown = ''
+        self._current_kline_context = None
+        self._status_message = ''
+        self._error_message = ''
+        self._followup_input.clear()
+        self._render_chat_history()
+        self._update_send_button_state()
+
+    def _set_request_in_progress(self, in_progress):
+        self._analyze_btn.setText('⏳ 分析中...' if in_progress else '🔍 开始分析')
+        self._analyze_btn.setEnabled(not in_progress)
+        self._followup_input.setEnabled((not in_progress) and bool(self._analysis_context_message))
+        self._update_send_button_state()
+
+    def _update_send_button_state(self):
+        can_send = (
+            self._analysis_thread is None and
+            bool(self._analysis_context_message) and
+            bool(self._followup_input.toPlainText().strip())
+        )
+        self._send_btn.setEnabled(can_send)
+
+    def _render_chat_history(self):
+        if not self._chat_messages:
+            if self._error_message:
+                self._result_browser.setHtml(self._build_result_placeholder(f'分析失败：{self._error_message}', '#e74c3c'))
+                return
+            if self._status_message:
+                self._result_browser.setHtml(self._build_result_placeholder(self._status_message))
+                return
+            self._result_browser.setHtml(
+                self._build_result_placeholder('点击「开始分析」获取金价分析报告，并在结果页继续追问')
+            )
+            return
+
+        blocks = []
+        for message in self._chat_messages:
+            role = message.get('role')
+            content = message.get('content', '')
+            if role == 'system':
+                continue
+            if role == 'assistant':
+                title = 'AI 分析'
+                body = _GoldAnalysisThread._md_to_html(content)
+                bg = self.theme_tokens['panel_alt']
+                border = self.theme_tokens['border']
+            else:
+                title = '我的追问'
+                escaped = html.escape(content).replace('\n', '<br>')
+                body = f'<p style="margin:0; line-height:1.6;">{escaped}</p>'
+                bg = self.theme_tokens['surface']
+                border = self.theme_tokens['border_soft']
+            blocks.append(
+                f'<div style="margin:0 0 10px 0; padding:10px 12px; background:{bg}; border:1px solid {border}; border-radius:8px;">'
+                f'<div style="font-size:7.5pt; color:{self.theme_tokens["text_muted"]}; margin-bottom:6px; font-weight:600;">{title}</div>'
+                f'{body}'
+                '</div>'
+            )
+
+        if self._status_message:
+            blocks.append(
+                f'<p style="color:{self.theme_tokens["text_muted"]}; text-align:center; margin:8px 0 2px 0;">{html.escape(self._status_message)}</p>'
+            )
+        if self._error_message:
+            blocks.append(
+                f'<p style="color:#e74c3c; margin:8px 0 2px 0;">分析失败：{html.escape(self._error_message)}</p>'
+            )
+
+        self._result_browser.setHtml(''.join(blocks))
+        self._result_browser.verticalScrollBar().setValue(
+            self._result_browser.verticalScrollBar().maximum()
+        )
+
     def _start_analysis(self):
         api_url = self._url_input.text().strip()
         api_key = self._key_input.text().strip()
@@ -1760,19 +1903,20 @@ class GoldAnalysisDialog(QDialog):
         prompt_template = self._prompt_input.toPlainText().strip()
         td_api_key = self._td_key_input.text().strip()
         if not api_url or not api_key or not model or not td_api_key:
-            t = self.theme_tokens
-            self._result_browser.setHtml(
-                '<p style="color:#e74c3c; text-align:center; margin-top:40px;">'
-                '请先填写完整的 API URL、API Key、TD Key 和 Model</p>'
-            )
+            self._error_message = '请先填写完整的 API URL、API Key、TD Key 和 Model'
+            self._status_message = ''
+            self._render_chat_history()
             return
 
-        self._analyze_btn.setText('⏳ 分析中...')
-        self._analyze_btn.setEnabled(False)
+        self._reset_chat_session()
+        self._request_mode = 'initial'
         self._tabs.setCurrentIndex(0)
-
+        self._set_request_in_progress(True)
         self._analysis_thread = _GoldAnalysisThread(
-            api_url, api_key, model, prompt_template, td_api_key
+            api_url, api_key, model,
+            prompt_template=prompt_template,
+            twelvedata_api_key=td_api_key,
+            follow_up_mode=False,
         )
         self._analysis_thread.progress_ready.connect(self._on_progress)
         self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
@@ -1780,28 +1924,74 @@ class GoldAnalysisDialog(QDialog):
         self._analysis_thread.error_ready.connect(self._on_error)
         self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
         self._analysis_thread.finished.connect(lambda: setattr(self, '_analysis_thread', None))
+        self._analysis_thread.finished.connect(lambda: self._set_request_in_progress(False))
+        self._analysis_thread.start()
+
+    def _send_followup(self):
+        if self._analysis_thread is not None or not self._analysis_context_message:
+            return
+        followup_text = self._followup_input.toPlainText().strip()
+        if not followup_text:
+            return
+
+        self._request_mode = 'follow_up'
+        self._status_message = ''
+        self._error_message = ''
+        self._chat_messages.append({'role': 'user', 'content': followup_text})
+        self._followup_input.clear()
+        self._render_chat_history()
+        self._tabs.setCurrentIndex(0)
+        messages = [self._analysis_context_message] + list(self._chat_messages)
+        self._set_request_in_progress(True)
+        self._analysis_thread = _GoldAnalysisThread(
+            self._url_input.text().strip(),
+            self._key_input.text().strip(),
+            self._model_input.text().strip(),
+            messages=messages,
+            follow_up_mode=True,
+        )
+        self._analysis_thread.progress_ready.connect(self._on_progress)
+        self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
+        self._analysis_thread.result_ready.connect(self._on_result)
+        self._analysis_thread.error_ready.connect(self._on_error)
+        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
+        self._analysis_thread.finished.connect(lambda: setattr(self, '_analysis_thread', None))
+        self._analysis_thread.finished.connect(lambda: self._set_request_in_progress(False))
         self._analysis_thread.start()
 
     def _on_progress(self, msg):
-        self._result_browser.setHtml(
-            '<p style="color:' + self.theme_tokens['text_muted'] +
-            '; text-align:center; margin-top:60px;">' + msg + '</p>'
-        )
+        self._status_message = msg
+        self._error_message = ''
+        self._render_chat_history()
 
     def _on_raw_data(self, html_table):
         self._raw_browser.setHtml(html_table)
 
-    def _on_result(self, html_text):
-        self._analyze_btn.setText('🔍 开始分析')
-        self._analyze_btn.setEnabled(True)
-        self._result_browser.setHtml(html_text)
+    def _on_result(self, payload):
+        self._status_message = ''
+        self._error_message = ''
+        if isinstance(payload, dict):
+            text = payload.get('reply', '')
+            self._latest_analysis_markdown = text
+            if payload.get('analysis_context_message'):
+                self._analysis_context_message = payload.get('analysis_context_message')
+                self._current_kline_context = payload.get('kline_context')
+                self._chat_messages = []
+            self._chat_messages.append({'role': 'assistant', 'content': text})
+        else:
+            self._latest_analysis_markdown = payload or ''
+            self._chat_messages.append({'role': 'assistant', 'content': payload or ''})
+        self._request_mode = None
+        self._render_chat_history()
 
     def _on_error(self, err_msg):
-        self._analyze_btn.setText('🔍 开始分析')
-        self._analyze_btn.setEnabled(True)
-        self._result_browser.setHtml(
-            '<p style="color:#e74c3c; margin-top:20px;">分析失败：' + err_msg + '</p>'
-        )
+        self._status_message = ''
+        self._error_message = err_msg
+        if self._request_mode == 'follow_up' and self._chat_messages and self._chat_messages[-1].get('role') == 'user':
+            failed_question = self._chat_messages.pop().get('content', '')
+            self._followup_input.setPlainText(failed_question)
+        self._request_mode = None
+        self._render_chat_history()
 
     # --- 拖动 & 关闭 ---
 
@@ -1847,19 +2037,30 @@ class _GoldAnalysisThread(QThread):
     """后台线程：抓取K线 + 计算指标 + 调用AI"""
     progress_ready = pyqtSignal(str)
     raw_data_ready = pyqtSignal(str)
-    result_ready = pyqtSignal(str)
+    result_ready = pyqtSignal(object)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, api_url, api_key, model, prompt_template='', twelvedata_api_key=''):
+    def __init__(self, api_url, api_key, model, prompt_template='', twelvedata_api_key='',
+                 messages=None, follow_up_mode=False):
         super().__init__()
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.prompt_template = prompt_template
         self.twelvedata_api_key = twelvedata_api_key
+        self.messages = messages or []
+        self.follow_up_mode = follow_up_mode
 
     def run(self):
         try:
+            if self.follow_up_mode:
+                self.progress_ready.emit('🤖 正在发送追问，请稍候...')
+                text = analyze_with_ai(
+                    self.api_url, self.api_key, self.model, self.messages
+                )
+                self.result_ready.emit({'reply': text})
+                return
+
             self.progress_ready.emit('⏬ 正在获取K线数据...')
             kline, kline_source = fetch_gold_kline(24, self.twelvedata_api_key)
             if not kline:
@@ -1869,21 +2070,29 @@ class _GoldAnalysisThread(QThread):
             self.progress_ready.emit('📊 正在计算技术指标...')
             ind = calculate_indicators(kline)
 
-            # 同时获取伦敦金现货实时价格（与用户监控一致）
             self.progress_ready.emit('💰 获取伦敦金现货价...')
             spot_price = fetch_london_gold_spot()
-
-            # 发送原始数据到 Tab2
             self.raw_data_ready.emit(self._build_raw_html(kline, ind, kline_source, spot_price))
 
             self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
-            text = analyze_with_ai(
-                self.api_url, self.api_key, self.model,
+            analysis_prompt = build_analysis_prompt(
                 kline, ind, self.prompt_template,
                 spot_price=spot_price, kline_source=kline_source
             )
-            html = self._md_to_html(text)
-            self.result_ready.emit(html)
+            analysis_context_message = {'role': 'user', 'content': analysis_prompt}
+            text = analyze_with_ai(
+                self.api_url, self.api_key, self.model, [analysis_context_message]
+            )
+            self.result_ready.emit({
+                'reply': text,
+                'analysis_context_message': analysis_context_message,
+                'kline_context': {
+                    'kline': kline,
+                    'indicators': ind,
+                    'spot_price': spot_price,
+                    'kline_source': kline_source,
+                },
+            })
         except Exception as e:
             self.error_ready.emit(str(e))
 

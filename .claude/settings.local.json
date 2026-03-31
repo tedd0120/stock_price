@@ -24,7 +24,8 @@
       "Bash(printf \"\\\\n---REMOTE---\\\\n\")",
       "Bash(git -C \"P:/git_repos/stock_price\" remote -v)",
       "Bash(git -C \"P:/git_repos/stock_price\" fetch origin)",
-      "Bash(git -C \"P:/git_repos/stock_price\" push --force-with-lease origin main)"
+      "Bash(git -C \"P:/git_repos/stock_price\" push --force-with-lease origin main)",
+      "Bash(git:*)"
     ]
   }
 }
