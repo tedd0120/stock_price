@@ -22,9 +22,14 @@ from stock_fetcher import StockFetcher, search_stocks, get_display_quote_code, _
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QLineEdit, QScrollArea, QWidget as QtQWidget,
-    QVBoxLayout as QtVBoxLayout
+    QVBoxLayout as QtVBoxLayout, QTextBrowser, QTabWidget,
+    QPlainTextEdit
 )
 import urllib.parse
+from gold_analyzer import (
+    fetch_gold_kline, calculate_indicators, analyze_with_ai,
+    test_api_connection, build_analysis_prompt
+)
 
 UI_FONT_FAMILY = 'Microsoft YaHei UI'
 UI_FONT_FALLBACK = 'Microsoft YaHei'
@@ -1353,6 +1358,476 @@ class GoldConverterDialog(QDialog):
         self._fade_out_anim = fade_out  # prevent GC
 
 
+class GoldAnalysisDialog(QDialog):
+    """金价AI分析对话框"""
+
+    def __init__(self, parent=None, dark_mode=True):
+        super().__init__(parent)
+        self.dark_mode = dark_mode
+        self.theme_tokens = get_theme_tokens(dark_mode)
+        self._drag_pos = None
+        self._analysis_thread = None
+        self._test_thread = None
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(580, 650)
+
+        self._fade_animation = QPropertyAnimation(self, b'windowOpacity')
+        self._fade_animation.setDuration(150)
+        self._fade_animation.setStartValue(0.0)
+        self._fade_animation.setEndValue(1.0)
+
+        t = self.theme_tokens
+        ff = "font-family: 'Microsoft YaHei', sans-serif;"
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        container = QWidget()
+        container.setStyleSheet(f"""
+            QWidget {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 10px;
+                {ff}
+            }}
+        """)
+        cl = QVBoxLayout(container)
+        cl.setContentsMargins(14, 10, 14, 12)
+        cl.setSpacing(5)
+
+        # --- 标题栏 ---
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(4)
+        title_icon = QLabel('📈')
+        title_icon.setStyleSheet(f'font-size: 12pt; {ff}')
+        title_label = QLabel('金价AI分析')
+        title_label.setStyleSheet(
+            f"color: {t['text_strong']}; font-size: 10pt; font-weight: 600; {ff}"
+        )
+        title_bar.addWidget(title_icon)
+        title_bar.addWidget(title_label)
+        title_bar.addStretch()
+        close_btn = QLabel('✕')
+        close_btn.setStyleSheet(
+            f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 4px; {ff}"
+        )
+        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        close_btn.mousePressEvent = lambda e: self._close_with_animation()
+        title_bar.addWidget(close_btn)
+        cl.addLayout(title_bar)
+
+        # --- AI 设置区 ---
+        settings_group = QWidget()
+        settings_group.setStyleSheet(
+            f"background-color: {t['panel_alt']}; border-radius: 5px; {ff}"
+        )
+        sl = QVBoxLayout(settings_group)
+        sl.setContentsMargins(8, 6, 8, 6)
+        sl.setSpacing(4)
+
+        setting_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        input_style = (
+            f"background-color: {t['surface']}; color: {t['text_strong']}; "
+            f"border: 1px solid {t['border']}; border-radius: 3px; padding: 2px 5px; "
+            f"font-size: 8pt; {ff}"
+        )
+
+        # URL
+        url_row = QHBoxLayout()
+        url_lbl = QLabel('API URL')
+        url_lbl.setFixedWidth(52)
+        url_lbl.setStyleSheet(setting_label_style)
+        self._url_input = QLineEdit()
+        self._url_input.setStyleSheet(input_style)
+        self._url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
+        url_row.addWidget(url_lbl)
+        url_row.addWidget(self._url_input)
+        sl.addLayout(url_row)
+
+        # Key
+        key_row = QHBoxLayout()
+        key_lbl = QLabel('API Key')
+        key_lbl.setFixedWidth(52)
+        key_lbl.setStyleSheet(setting_label_style)
+        self._key_input = QLineEdit()
+        self._key_input.setStyleSheet(input_style)
+        self._key_input.setEchoMode(QLineEdit.Password)
+        self._key_input.setPlaceholderText('sk-...')
+        key_row.addWidget(key_lbl)
+        key_row.addWidget(self._key_input)
+        sl.addLayout(key_row)
+
+        # Model
+        model_row = QHBoxLayout()
+        model_lbl = QLabel('Model')
+        model_lbl.setFixedWidth(52)
+        model_lbl.setStyleSheet(setting_label_style)
+        self._model_input = QLineEdit()
+        self._model_input.setStyleSheet(input_style)
+        self._model_input.setPlaceholderText('minimax-m2.7')
+        model_row.addWidget(model_lbl)
+        model_row.addWidget(self._model_input)
+        sl.addLayout(model_row)
+
+        # 自定义提示词
+        prompt_row = QHBoxLayout()
+        prompt_lbl = QLabel('提示词')
+        prompt_lbl.setFixedWidth(52)
+        prompt_lbl.setStyleSheet(setting_label_style)
+        self._prompt_input = QLineEdit()
+        self._prompt_input.setStyleSheet(input_style)
+        self._prompt_input.setPlaceholderText('自定义分析师提示词（可选，留空用默认）')
+        prompt_row.addWidget(prompt_lbl)
+        prompt_row.addWidget(self._prompt_input)
+        sl.addLayout(prompt_row)
+
+        cl.addWidget(settings_group)
+
+        # --- 按钮行：连通性测试 + 开始分析 ---
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+
+        self._test_btn = QPushButton('🔗 测试连通')
+        self._test_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._test_btn.setFixedWidth(100)
+        self._test_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+            QPushButton:disabled {{
+                color: {t['text_muted']};
+            }}
+        """)
+        self._test_btn.clicked.connect(self._test_connection)
+        btn_row.addWidget(self._test_btn)
+
+        # 连通性测试结果标签
+        self._test_result_label = QLabel('')
+        self._test_result_label.setStyleSheet(f"font-size: 7.5pt; {ff}")
+        btn_row.addWidget(self._test_result_label)
+        btn_row.addStretch()
+
+        self._analyze_btn = QPushButton('🔍 开始分析')
+        self._analyze_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._analyze_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['accent']}; color: #ffffff;
+                border: none; border-radius: 5px; padding: 6px;
+                font-size: 9pt; font-weight: 600; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['accent_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {t['accent_pressed']};
+            }}
+            QPushButton:disabled {{
+                background-color: {t['surface']}; color: {t['text_muted']};
+            }}
+        """)
+        self._analyze_btn.clicked.connect(self._start_analysis)
+        btn_row.addWidget(self._analyze_btn)
+        cl.addLayout(btn_row)
+
+        # --- Tab 区域：分析结果 + 原始数据 ---
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                background-color: {t['panel_alt']};
+            }}
+            QTabBar::tab {{
+                background-color: {t['surface']}; color: {t['text']};
+                padding: 4px 12px; font-size: 8pt; {ff}
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                font-weight: 600;
+            }}
+        """)
+
+        # Tab 1: 分析结果
+        self._result_browser = QTextBrowser()
+        self._result_browser.setOpenExternalLinks(False)
+        self._result_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: none;
+                padding: 6px;
+                font-size: 8.5pt; {ff}
+            }}
+        """)
+        self._result_browser.setHtml(
+            '<p style="color:' + t['text_muted'] + '; text-align:center; margin-top:60px;">'
+            '点击「开始分析」获取金价分析报告</p>'
+        )
+        self._tabs.addTab(self._result_browser, '📊 分析结果')
+
+        # Tab 2: 原始数据
+        self._raw_browser = QTextBrowser()
+        self._raw_browser.setOpenExternalLinks(False)
+        self._raw_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: none;
+                padding: 6px;
+                font-size: 7.5pt; {ff}
+            }}
+        """)
+        self._raw_browser.setHtml(
+            '<p style="color:' + t['text_muted'] + '; text-align:center; margin-top:40px;">'
+            '暂无数据，请先点击「开始分析」</p>'
+        )
+        self._tabs.addTab(self._raw_browser, '📋 原始数据')
+
+        cl.addWidget(self._tabs)
+        main_layout.addWidget(container)
+
+    def load_settings(self, ai_config):
+        """从 config 加载 AI 设置"""
+        if ai_config.get('api_url'):
+            self._url_input.setText(ai_config['api_url'])
+        if ai_config.get('api_key'):
+            self._key_input.setText(ai_config['api_key'])
+        if ai_config.get('model'):
+            self._model_input.setText(ai_config['model'])
+        if ai_config.get('custom_prompt'):
+            self._prompt_input.setText(ai_config['custom_prompt'])
+
+    def save_settings(self):
+        """返回当前 AI 设置（含自定义提示词）"""
+        return {
+            'api_url': self._url_input.text().strip(),
+            'api_key': self._key_input.text().strip(),
+            'model': self._model_input.text().strip(),
+            'custom_prompt': self._prompt_input.text().strip(),
+        }
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fade_animation.start()
+
+    # --- 连通性测试 ---
+
+    def _test_connection(self):
+        api_url = self._url_input.text().strip()
+        api_key = self._key_input.text().strip()
+        model = self._model_input.text().strip()
+        if not api_url or not api_key or not model:
+            self._test_result_label.setText('<span style="color:#e74c3c;">请先填写完整配置</span>')
+            return
+        self._test_btn.setText('⏳ 测试中')
+        self._test_btn.setEnabled(False)
+        self._test_result_label.setText('')
+        self._test_thread = _ApiTestThread(api_url, api_key, model)
+        self._test_thread.result_ready.connect(self._on_test_result)
+        self._test_thread.finished.connect(self._test_thread.deleteLater)
+        self._test_thread.finished.connect(lambda: setattr(self, '_test_thread', None))
+        self._test_thread.start()
+
+    def _on_test_result(self, success, msg):
+        self._test_btn.setText('🔗 测试连通')
+        self._test_btn.setEnabled(True)
+        color = '#27ae60' if success else '#e74c3c'
+        icon = '✅' if success else '❌'
+        self._test_result_label.setText(f'<span style="color:{color};">{icon} {msg}</span>')
+
+    # --- 分析逻辑 ---
+
+    def _start_analysis(self):
+        api_url = self._url_input.text().strip()
+        api_key = self._key_input.text().strip()
+        model = self._model_input.text().strip()
+        custom_prompt = self._prompt_input.text().strip()
+        if not api_url or not api_key or not model:
+            t = self.theme_tokens
+            self._result_browser.setHtml(
+                '<p style="color:#e74c3c; text-align:center; margin-top:40px;">'
+                '请先填写完整的 API URL、API Key 和 Model</p>'
+            )
+            return
+
+        self._analyze_btn.setText('⏳ 分析中...')
+        self._analyze_btn.setEnabled(False)
+        self._tabs.setCurrentIndex(0)
+
+        self._analysis_thread = _GoldAnalysisThread(
+            api_url, api_key, model, custom_prompt
+        )
+        self._analysis_thread.progress_ready.connect(self._on_progress)
+        self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
+        self._analysis_thread.result_ready.connect(self._on_result)
+        self._analysis_thread.error_ready.connect(self._on_error)
+        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
+        self._analysis_thread.finished.connect(lambda: setattr(self, '_analysis_thread', None))
+        self._analysis_thread.start()
+
+    def _on_progress(self, msg):
+        self._result_browser.setHtml(
+            '<p style="color:' + self.theme_tokens['text_muted'] +
+            '; text-align:center; margin-top:60px;">' + msg + '</p>'
+        )
+
+    def _on_raw_data(self, html_table):
+        self._raw_browser.setHtml(html_table)
+
+    def _on_result(self, html_text):
+        self._analyze_btn.setText('🔍 开始分析')
+        self._analyze_btn.setEnabled(True)
+        self._result_browser.setHtml(html_text)
+
+    def _on_error(self, err_msg):
+        self._analyze_btn.setText('🔍 开始分析')
+        self._analyze_btn.setEnabled(True)
+        self._result_browser.setHtml(
+            '<p style="color:#e74c3c; margin-top:20px;">分析失败：' + err_msg + '</p>'
+        )
+
+    # --- 拖动 & 关闭 ---
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.y() < 35:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+        else:
+            self._drag_pos = None
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+
+    def _close_with_animation(self):
+        fade_out = QPropertyAnimation(self, b'windowOpacity')
+        fade_out.setDuration(100)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+        fade_out.finished.connect(self.close)
+        fade_out.start()
+        self._fade_out_anim = fade_out
+
+
+class _ApiTestThread(QThread):
+    """后台线程：测试API连通性"""
+    result_ready = pyqtSignal(bool, str)
+
+    def __init__(self, api_url, api_key, model):
+        super().__init__()
+        self.api_url = api_url
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        ok, msg = test_api_connection(self.api_url, self.api_key, self.model)
+        self.result_ready.emit(ok, msg)
+
+
+class _GoldAnalysisThread(QThread):
+    """后台线程：抓取K线 + 计算指标 + 调用AI"""
+    progress_ready = pyqtSignal(str)
+    raw_data_ready = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, api_url, api_key, model, custom_prompt=''):
+        super().__init__()
+        self.api_url = api_url
+        self.api_key = api_key
+        self.model = model
+        self.custom_prompt = custom_prompt
+
+    def run(self):
+        try:
+            self.progress_ready.emit('⏬ 正在获取K线数据...')
+            kline = fetch_gold_kline(24)
+            if not kline:
+                self.error_ready.emit('无法获取K线数据')
+                return
+
+            self.progress_ready.emit('📊 正在计算技术指标...')
+            ind = calculate_indicators(kline)
+
+            # 发送原始数据到 Tab2
+            self.raw_data_ready.emit(self._build_raw_html(kline, ind))
+
+            self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
+            text = analyze_with_ai(
+                self.api_url, self.api_key, self.model,
+                kline, ind, self.custom_prompt
+            )
+            html = self._md_to_html(text)
+            self.result_ready.emit(html)
+        except Exception as e:
+            self.error_ready.emit(str(e))
+
+    @staticmethod
+    def _build_raw_html(kline, ind):
+        """构建原始数据 HTML 表格"""
+        rows = ''
+        for c in kline:
+            rows += (
+                f"<tr><td>{c['time']}</td>"
+                f"<td>{c['open']}</td><td>{c['high']}</td>"
+                f"<td>{c['low']}</td><td>{c['close']}</td>"
+                f"<td>{c['volume']}</td></tr>"
+            )
+        import json
+        ind_text = json.dumps(ind, indent=2, ensure_ascii=False)
+        return (
+            '<h4>K线数据（60分钟）</h4>'
+            '<table style="width:100%;border-collapse:collapse;font-size:7.5pt;">'
+            '<tr style="font-weight:600;border-bottom:1px solid #444;">'
+            '<td>时间</td><td>开盘</td><td>最高</td><td>最低</td><td>收盘</td><td>成交量</td></tr>'
+            f'{rows}</table><br>'
+            f'<h4>技术指标</h4><pre style="font-size:7.5pt;">{ind_text}</pre>'
+        )
+
+    @staticmethod
+    def _md_to_html(md_text):
+        """简易 Markdown 转 HTML"""
+        import re
+        lines = md_text.split('\n')
+        html_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('### '):
+                html_lines.append(f'<h4>{stripped[4:]}</h4>')
+            elif stripped.startswith('## '):
+                html_lines.append(f'<h3>{stripped[3:]}</h3>')
+            elif stripped.startswith('# '):
+                html_lines.append(f'<h2>{stripped[2:]}</h2>')
+            elif stripped == '---':
+                html_lines.append('<hr>')
+            elif stripped.startswith('- ') or stripped.startswith('* '):
+                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
+                html_lines.append(f'<div style="margin-left:12px;">• {content}</div>')
+            elif re.match(r'^\d+\.\s', stripped):
+                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
+                html_lines.append(f'<div style="margin-left:12px;">{content}</div>')
+            elif stripped.startswith('> '):
+                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
+                html_lines.append(f'<blockquote style="border-left:3px solid #4a9eff;padding-left:8px;color:#8a9aaa;">{content}</blockquote>')
+            else:
+                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
+                html_lines.append(f'<p>{content}</p>' if stripped else '<br>')
+        return '\n'.join(html_lines)
+
+
 class StockWidget(QWidget):
     """主悬浮窗组件"""
 
@@ -1763,6 +2238,10 @@ class StockWidget(QWidget):
         gold_converter_action = menu.addAction('🥇 金价换算器')
         gold_converter_action.triggered.connect(self._open_gold_converter)
 
+        # 实时分析金价
+        gold_analysis_action = menu.addAction('📈 实时分析金价')
+        gold_analysis_action.triggered.connect(self._open_gold_analysis)
+
         menu.addSeparator()
 
         # 退出
@@ -1851,6 +2330,17 @@ class StockWidget(QWidget):
         dialog.exec_()
         # 保存升贴水
         self.config['gold_premium'] = dialog._premium_input.text()
+        self._save_config()
+
+    def _open_gold_analysis(self):
+        """打开金价AI分析"""
+        dialog = GoldAnalysisDialog(self, dark_mode=self.dark_mode)
+        ai_config = self.config.get('ai_settings', {})
+        dialog.load_settings(ai_config)
+        screen = QApplication.primaryScreen().geometry()
+        dialog.move(screen.center().x() - 280, screen.center().y() - 310)
+        dialog.exec_()
+        self.config['ai_settings'] = dialog.save_settings()
         self._save_config()
 
     def _refresh_all_rows(self):
