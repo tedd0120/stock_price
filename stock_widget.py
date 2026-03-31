@@ -27,7 +27,8 @@ from PyQt5.QtWidgets import (
 )
 import urllib.parse
 from gold_analyzer import (
-    fetch_gold_kline, calculate_indicators, analyze_with_ai,
+    fetch_gold_kline, fetch_london_gold_spot,
+    calculate_indicators, analyze_with_ai,
     test_api_connection, build_analysis_prompt
 )
 
@@ -767,8 +768,9 @@ class StockListDialog(QDialog):
         main_layout.setSpacing(0)
 
         container = QWidget()
+        container.setObjectName('stockListContainer')
         container.setStyleSheet(f"""
-            QWidget {{
+            QWidget#stockListContainer {{
                 background-color: {self.theme_tokens['panel']};
                 border: 1px solid {self.theme_tokens['border_soft']};
                 border-radius: 10px;
@@ -1124,8 +1126,9 @@ class GoldConverterDialog(QDialog):
         main_layout.setSpacing(0)
 
         container = QWidget()
+        container.setObjectName('goldConverterContainer')
         container.setStyleSheet(f"""
-            QWidget {{
+            QWidget#goldConverterContainer {{
                 background-color: {t['panel']};
                 border: 1px solid {t['border_soft']};
                 border-radius: 10px;
@@ -1385,8 +1388,9 @@ class GoldAnalysisDialog(QDialog):
         main_layout.setSpacing(0)
 
         container = QWidget()
+        container.setObjectName('goldAnalysisContainer')
         container.setStyleSheet(f"""
-            QWidget {{
+            QWidget#goldAnalysisContainer {{
                 background-color: {t['panel']};
                 border: 1px solid {t['border_soft']};
                 border-radius: 10px;
@@ -1420,17 +1424,16 @@ class GoldAnalysisDialog(QDialog):
 
         # --- AI 设置区 ---
         settings_group = QWidget()
-        settings_group.setStyleSheet(
-            f"background-color: {t['panel_alt']}; border-radius: 5px; {ff}"
-        )
+        settings_group.setStyleSheet(f"{ff}")
         sl = QVBoxLayout(settings_group)
-        sl.setContentsMargins(8, 6, 8, 6)
+        sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(4)
 
         setting_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
         input_style = (
-            f"background-color: {t['surface']}; color: {t['text_strong']}; "
-            f"border: 1px solid {t['border']}; border-radius: 3px; padding: 2px 5px; "
+            f"background-color: transparent; color: {t['text_strong']}; "
+            f"border: none; border-bottom: 1px solid {t['border']}; "
+            f"border-radius: 0px; padding: 2px 5px; "
             f"font-size: 8pt; {ff}"
         )
 
@@ -1754,7 +1757,7 @@ class _GoldAnalysisThread(QThread):
     def run(self):
         try:
             self.progress_ready.emit('⏬ 正在获取K线数据...')
-            kline = fetch_gold_kline(24)
+            kline, kline_source = fetch_gold_kline(24)
             if not kline:
                 self.error_ready.emit('无法获取K线数据')
                 return
@@ -1762,13 +1765,18 @@ class _GoldAnalysisThread(QThread):
             self.progress_ready.emit('📊 正在计算技术指标...')
             ind = calculate_indicators(kline)
 
+            # 同时获取伦敦金现货实时价格（与用户监控一致）
+            self.progress_ready.emit('💰 获取伦敦金现货价...')
+            spot_price = fetch_london_gold_spot()
+
             # 发送原始数据到 Tab2
-            self.raw_data_ready.emit(self._build_raw_html(kline, ind))
+            self.raw_data_ready.emit(self._build_raw_html(kline, ind, kline_source, spot_price))
 
             self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
             text = analyze_with_ai(
                 self.api_url, self.api_key, self.model,
-                kline, ind, self.custom_prompt
+                kline, ind, self.custom_prompt,
+                spot_price=spot_price, kline_source=kline_source
             )
             html = self._md_to_html(text)
             self.result_ready.emit(html)
@@ -1776,7 +1784,7 @@ class _GoldAnalysisThread(QThread):
             self.error_ready.emit(str(e))
 
     @staticmethod
-    def _build_raw_html(kline, ind):
+    def _build_raw_html(kline, ind, kline_source='', spot_price=0):
         """构建原始数据 HTML 表格"""
         rows = ''
         for c in kline:
@@ -1788,7 +1796,16 @@ class _GoldAnalysisThread(QThread):
             )
         import json
         ind_text = json.dumps(ind, indent=2, ensure_ascii=False)
+
+        source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
+        if spot_price > 0:
+            source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">伦敦金现货价(新浪): {spot_price} 美元/盎司</p>'
+            if kline_source and 'Yahoo' in kline_source:
+                spread = round(ind['current_price'] - spot_price, 2)
+                source_info += f'<p style="font-size:7.5pt;color:#e7c24a;">期货溢价: {spread} 美元（分析已自动校准至现货价）</p>'
+
         return (
+            f'{source_info}'
             '<h4>K线数据（60分钟）</h4>'
             '<table style="width:100%;border-collapse:collapse;font-size:7.5pt;">'
             '<tr style="font-weight:600;border-bottom:1px solid #444;">'

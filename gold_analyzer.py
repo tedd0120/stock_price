@@ -2,15 +2,86 @@
 金价AI分析模块 - K线抓取、技术指标计算、AI分析
 """
 import json
+import datetime
 import requests
 
 
-# ──────────────── K线数据抓取 ────────────────
+# ──────────────── 数据抓取 ────────────────
+
+def _safe_float(val):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def fetch_london_gold_spot():
+    """从新浪获取伦敦金现货(hf_XAU)实时价格，返回 float 或 0"""
+    try:
+        url = 'http://hq.sinajs.cn/list=hf_XAU'
+        headers = {'Referer': 'https://finance.sina.com.cn/'}
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.encoding = 'gbk'
+        line = resp.text.strip()
+        val = line.split('"')[1]
+        parts = val.split(',')
+        return _safe_float(parts[0])
+    except Exception:
+        return 0.0
+
 
 def fetch_gold_kline(datalen=24):
-    """从 Yahoo Finance 获取 COMEX 黄金期货 60 分钟 K 线数据，返回最近 datalen 根有效 K 线。
-    每根 K 线: {'time': str, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}
+    """获取黄金 60 分钟 K 线数据。
+    优先使用新浪 hf_XAU（伦敦金现货）；若新浪K线不可用，回退到 Yahoo GC=F（COMEX期货）。
+    返回 (candles, source_name):
+        candles: list[dict]，每根 {'time', 'open', 'high', 'low', 'close', 'volume'}
+        source_name: str, '新浪伦敦金(hf_XAU)' 或 'Yahoo COMEX期货(GC=F)'
     """
+    # 尝试新浪 K 线
+    candles = _fetch_sina_kline(datalen)
+    if candles:
+        return candles, '新浪伦敦金(hf_XAU)'
+    # 回退到 Yahoo
+    candles = _fetch_yahoo_kline(datalen)
+    return candles, 'Yahoo COMEX期货(GC=F)'
+
+
+def _fetch_sina_kline(datalen):
+    """尝试从新浪获取伦敦金 K 线（多个接口尝试）"""
+    # 尝试1: 新浪国际期货分钟K线
+    try:
+        url = 'https://stock.finance.sina.com.cn/futures/api/jsonp.php/callback/HF_MinKline.getMinKline'
+        params = {'symbol': 'XAU', 'scale': '60', 'datalen': str(datalen)}
+        headers = {
+            'Referer': 'https://finance.sina.com.cn/futures/quotes/XAU.shtml',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        text = resp.text
+        # 解析 JSONP
+        json_str = text.split('(', 1)[1].rstrip(')')
+        if json_str == 'null' or '"__ERROR"' in json_str:
+            raise ValueError('sina kline not available')
+        data = json.loads(json_str)
+        candles = []
+        for item in data:
+            candles.append({
+                'time': item.get('d', item.get('day', '')),
+                'open': _safe_float(item.get('o', item.get('open', 0))),
+                'high': _safe_float(item.get('h', item.get('high', 0))),
+                'low': _safe_float(item.get('l', item.get('low', 0))),
+                'close': _safe_float(item.get('c', item.get('close', 0))),
+                'volume': int(_safe_float(item.get('v', item.get('volume', 0)))),
+            })
+        if candles:
+            return candles[-datalen:]
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_yahoo_kline(datalen):
+    """从 Yahoo Finance 获取 COMEX 黄金期货(GC=F) 60 分钟 K 线"""
     url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F'
     params = {'interval': '1h', 'range': '3d'}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -22,7 +93,6 @@ def fetch_gold_kline(datalen=24):
     ts = result['timestamp']
     q = result['indicators']['quote'][0]
 
-    import datetime
     candles = []
     for i, t in enumerate(ts):
         o, h, l, c, v = q['open'][i], q['high'][i], q['low'][i], q['close'][i], q['volume'][i]
@@ -200,7 +270,7 @@ def calculate_indicators(kline_data):
 
 # ──────────────── AI 分析调用 ────────────────
 
-def build_analysis_prompt(kline_data, indicators, custom_prompt=''):
+def build_analysis_prompt(kline_data, indicators, custom_prompt='', spot_price=0, kline_source=''):
     """构造 AI 分析用的 prompt。custom_prompt 为用户自定义提示词（附加到末尾）。"""
     # K线表格
     kline_table = '| 时间 | 开盘 | 最高 | 最低 | 收盘 | 成交量 |\n|---|---|---|---|---|---|\n'
@@ -208,7 +278,20 @@ def build_analysis_prompt(kline_data, indicators, custom_prompt=''):
         kline_table += f"| {c['time']} | {c['open']} | {c['high']} | {c['low']} | {c['close']} | {c['volume']} |\n"
 
     ind = indicators
-    prompt = f"""你是一位专业的黄金市场分析师。请根据以下 COMEX 黄金期货(GC=F) 过去约24小时的60分钟K线数据和技术指标，提供一份简洁的分析报告。
+
+    # 数据源说明
+    source_note = ''
+    if kline_source and 'Yahoo' in kline_source:
+        source_note = f'\n注意：K线数据来源为 {kline_source}，与伦敦金现货价格存在约30-40美元期货溢价。'
+        if spot_price > 0:
+            spread = round(ind['current_price'] - spot_price, 2)
+            source_note += f'\n当前K线收盘价 {ind["current_price"]}，伦敦金现货价 {spot_price}，期货溢价 {spread} 美元。'
+            source_note += '\n分析支撑/阻力位和买卖建议时，请参考伦敦金现货价格（即K线价格减去溢价）给出。'
+    if spot_price > 0:
+        source_note += f'\n\n## 伦敦金(XAU/USD)实时现货价\n{spot_price} 美元/盎司'
+
+    prompt = f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟K线数据和技术指标，提供一份简洁的分析报告。
+{source_note}
 
 ## K线数据（60分钟周期）
 {kline_table}
@@ -222,25 +305,24 @@ def build_analysis_prompt(kline_data, indicators, custom_prompt=''):
 - ATR(14)={ind['atr']}
 - 近5根K线价格变化: {ind['price_change_5']}
 
-## 当前价格
-{ind['current_price']} 美元/盎司
-
 请用中文提供以下分析（使用Markdown格式）：
 1. **短期趋势判断**（多头/空头/震荡）及理由
-2. **关键支撑位和阻力位**
+2. **关键支撑位和阻力位**（基于伦敦金现货价）
 3. **技术指标综合解读**（每个指标说明了什么）
 4. **具体买卖建议**（做多/做空/观望，入场价位，止损建议）
 5. **风险提示**
 
-要求：分析简明扼要，重点突出可操作性建议。不要用表格。"""
+要求：分析简明扼要，重点突出可操作性建议。所有价位以伦敦金现货价为准。不要用表格。"""
     if custom_prompt and custom_prompt.strip():
         prompt += f'\n\n## 附加要求\n{custom_prompt.strip()}'
     return prompt
 
 
-def analyze_with_ai(api_url, api_key, model, kline_data, indicators, custom_prompt=''):
+def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
+                    custom_prompt='', spot_price=0, kline_source=''):
     """调用 Anthropic 兼容接口进行金价分析，返回分析文本"""
-    prompt = build_analysis_prompt(kline_data, indicators, custom_prompt)
+    prompt = build_analysis_prompt(kline_data, indicators, custom_prompt,
+                                   spot_price, kline_source)
 
     # Anthropic Messages API
     url = f"{api_url.rstrip('/')}/v1/messages"
