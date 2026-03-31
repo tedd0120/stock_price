@@ -1105,7 +1105,7 @@ class GoldConverterDialog(QDialog):
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(340, 350)
+        self.setFixedSize(300, 310)
 
         self._fade_animation = QPropertyAnimation(self, b'windowOpacity')
         self._fade_animation.setDuration(150)
@@ -1128,24 +1128,24 @@ class GoldConverterDialog(QDialog):
             }}
         """)
         cl = QVBoxLayout(container)
-        cl.setContentsMargins(16, 10, 16, 12)
-        cl.setSpacing(8)
+        cl.setContentsMargins(12, 8, 12, 10)
+        cl.setSpacing(5)
 
         # --- 标题栏 ---
         title_bar = QHBoxLayout()
-        title_bar.setSpacing(6)
+        title_bar.setSpacing(4)
         title_icon = QLabel('🥇')
-        title_icon.setStyleSheet(f'font-size: 14pt; {ff}')
+        title_icon.setStyleSheet(f'font-size: 12pt; {ff}')
         title_label = QLabel('金价换算器')
         title_label.setStyleSheet(
-            f"color: {t['text_strong']}; font-size: 10pt; font-weight: 600; {ff}"
+            f"color: {t['text_strong']}; font-size: 9pt; font-weight: 600; {ff}"
         )
         title_bar.addWidget(title_icon)
         title_bar.addWidget(title_label)
         title_bar.addStretch()
         close_btn = QLabel('✕')
         close_btn.setStyleSheet(
-            f"color: {t['text_muted']}; font-size: 11pt; padding: 2px 6px; {ff}"
+            f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 4px; {ff}"
         )
         close_btn.setCursor(QCursor(Qt.PointingHandCursor))
         close_btn.mousePressEvent = lambda e: self._close_with_animation()
@@ -1155,17 +1155,17 @@ class GoldConverterDialog(QDialog):
         # --- 实时价格（仅伦敦金 + 汇率）---
         price_group = QWidget()
         price_group.setStyleSheet(
-            f"background-color: {t['panel_alt']}; border-radius: 6px; {ff}"
+            f"background-color: {t['panel_alt']}; border-radius: 5px; {ff}"
         )
         pl = QVBoxLayout(price_group)
-        pl.setContentsMargins(10, 8, 10, 8)
-        pl.setSpacing(4)
+        pl.setContentsMargins(8, 5, 8, 5)
+        pl.setSpacing(2)
 
         self._london_price_label = QLabel('伦敦金 (XAU)    -- 美元/盎司')
         self._rate_label = QLabel('美元汇率         --')
         for lbl in (self._london_price_label, self._rate_label):
             lbl.setStyleSheet(
-                f"color: {t['text']}; font-size: 9pt; {ff}"
+                f"color: {t['text']}; font-size: 8pt; {ff}"
             )
             pl.addWidget(lbl)
         cl.addWidget(price_group)
@@ -1173,16 +1173,16 @@ class GoldConverterDialog(QDialog):
         # --- 换算输入 ---
         input_style = (
             f"background-color: {t['panel_alt']}; color: {t['text_strong']}; "
-            f"border: 1px solid {t['border']}; border-radius: 4px; padding: 4px 8px; "
-            f"font-size: 10pt; {ff}"
+            f"border: 1px solid {t['border']}; border-radius: 4px; padding: 3px 6px; "
+            f"font-size: 9pt; {ff}"
         )
-        label_style = f"color: {t['text']}; font-size: 9pt; {ff}"
+        label_style = f"color: {t['text']}; font-size: 8pt; {ff}"
 
         # 伦敦金输入
         row1 = QHBoxLayout()
-        row1.setSpacing(8)
+        row1.setSpacing(6)
         lbl1 = QLabel('伦敦金')
-        lbl1.setFixedWidth(48)
+        lbl1.setFixedWidth(40)
         lbl1.setStyleSheet(label_style)
         self._london_input = QLineEdit()
         self._london_input.setPlaceholderText('美元/盎司')
@@ -1193,9 +1193,9 @@ class GoldConverterDialog(QDialog):
 
         # 沪金输入
         row2 = QHBoxLayout()
-        row2.setSpacing(8)
+        row2.setSpacing(6)
         lbl2 = QLabel('沪金')
-        lbl2.setFixedWidth(48)
+        lbl2.setFixedWidth(40)
         lbl2.setStyleSheet(label_style)
         self._shanghai_input = QLineEdit()
         self._shanghai_input.setPlaceholderText('元/克')
@@ -1206,9 +1206,9 @@ class GoldConverterDialog(QDialog):
 
         # 升贴水输入
         row3 = QHBoxLayout()
-        row3.setSpacing(8)
+        row3.setSpacing(6)
         lbl3 = QLabel('升贴水')
-        lbl3.setFixedWidth(48)
+        lbl3.setFixedWidth(40)
         lbl3.setStyleSheet(label_style)
         self._premium_input = QLineEdit()
         self._premium_input.setPlaceholderText('元/克 (可选)')
@@ -1219,13 +1219,13 @@ class GoldConverterDialog(QDialog):
 
         # 银行积存金结果
         row4 = QHBoxLayout()
-        row4.setSpacing(8)
+        row4.setSpacing(6)
         lbl4 = QLabel('积存金')
-        lbl4.setFixedWidth(48)
+        lbl4.setFixedWidth(40)
         lbl4.setStyleSheet(label_style)
         self._bank_result = QLabel('-- 元/克')
         self._bank_result.setStyleSheet(
-            f"color: {t['accent']}; font-size: 10pt; font-weight: 600; {ff}"
+            f"color: {t['accent']}; font-size: 9pt; font-weight: 600; {ff}"
         )
         row4.addWidget(lbl4)
         row4.addWidget(self._bank_result)
@@ -1242,8 +1242,8 @@ class GoldConverterDialog(QDialog):
         self._refresh_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {t['surface']}; color: {t['text']};
-                border: 1px solid {t['border']}; border-radius: 6px;
-                padding: 6px 0; font-size: 9pt; {ff}
+                border: 1px solid {t['border']}; border-radius: 5px;
+                padding: 4px 0; font-size: 8pt; {ff}
             }}
             QPushButton:hover {{
                 background-color: {t['surface_hover']};
@@ -1845,8 +1845,8 @@ class StockWidget(QWidget):
             dialog._premium_input.setText(str(premium))
         screen = QApplication.primaryScreen().geometry()
         dialog.move(
-            screen.center().x() - 170,
-            screen.center().y() - 175
+            screen.center().x() - 150,
+            screen.center().y() - 155
         )
         dialog.exec_()
         # 保存升贴水
