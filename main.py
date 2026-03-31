@@ -28,6 +28,7 @@ def load_config():
         ],
         "refresh_interval": 2,
         "opacity": 0.85,
+        "ai_settings": {},
     }
 
     def normalize_config_symbols(config):

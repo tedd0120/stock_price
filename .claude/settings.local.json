@@ -7,7 +7,10 @@
       "Bash(curl:*)",
       "mcp__web-search-prime__web_search_prime",
       "Bash(__NEW_LINE_10953f8922a176a2__ echo:*)",
-      "mcp__zai-mcp-server__analyze_image"
+      "mcp__zai-mcp-server__analyze_image",
+      "mcp__zread__search_doc",
+      "mcp__zread__get_repo_structure",
+      "mcp__zread__read_file"
     ]
   }
 }

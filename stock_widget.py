@@ -29,7 +29,8 @@ import urllib.parse
 from gold_analyzer import (
     fetch_gold_kline, fetch_london_gold_spot,
     calculate_indicators, analyze_with_ai,
-    test_api_connection, build_analysis_prompt
+    test_api_connection, get_default_analysis_prompt,
+    normalize_prompt_template
 )
 
 UI_FONT_FAMILY = 'Microsoft YaHei UI'
@@ -1371,9 +1372,11 @@ class GoldAnalysisDialog(QDialog):
         self._drag_pos = None
         self._analysis_thread = None
         self._test_thread = None
+        self._owner_widget = parent
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setFixedSize(580, 650)
 
         self._fade_animation = QPropertyAnimation(self, b'windowOpacity')
@@ -1413,6 +1416,13 @@ class GoldAnalysisDialog(QDialog):
         title_bar.addWidget(title_icon)
         title_bar.addWidget(title_label)
         title_bar.addStretch()
+        min_btn = QLabel('—')
+        min_btn.setStyleSheet(
+            f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 6px; {ff}"
+        )
+        min_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        min_btn.mousePressEvent = lambda e: self.showMinimized()
+        title_bar.addWidget(min_btn)
         close_btn = QLabel('✕')
         close_btn.setStyleSheet(
             f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 4px; {ff}"
@@ -1474,23 +1484,30 @@ class GoldAnalysisDialog(QDialog):
         model_row.addWidget(self._model_input)
         sl.addLayout(model_row)
 
-        # 自定义提示词
-        prompt_row = QHBoxLayout()
-        prompt_lbl = QLabel('提示词')
-        prompt_lbl.setFixedWidth(52)
-        prompt_lbl.setStyleSheet(setting_label_style)
-        self._prompt_input = QLineEdit()
-        self._prompt_input.setStyleSheet(input_style)
-        self._prompt_input.setPlaceholderText('自定义分析师提示词（可选，留空用默认）')
-        prompt_row.addWidget(prompt_lbl)
-        prompt_row.addWidget(self._prompt_input)
-        sl.addLayout(prompt_row)
-
         cl.addWidget(settings_group)
 
-        # --- 按钮行：连通性测试 + 开始分析 ---
+        # --- 按钮行：保存 + 连通性测试 + 开始分析 ---
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
+
+        self._save_btn = QPushButton('💾 Save')
+        self._save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._save_btn.setFixedWidth(80)
+        self._save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+            QPushButton:disabled {{
+                color: {t['text_muted']};
+            }}
+        """)
+        self._save_btn.clicked.connect(self._save_current_settings)
+        btn_row.addWidget(self._save_btn)
 
         self._test_btn = QPushButton('🔗 测试连通')
         self._test_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -1597,28 +1614,92 @@ class GoldAnalysisDialog(QDialog):
         )
         self._tabs.addTab(self._raw_browser, '📋 原始数据')
 
+        # Tab 3: 提示词
+        prompt_tab = QWidget()
+        prompt_layout = QVBoxLayout(prompt_tab)
+        prompt_layout.setContentsMargins(10, 10, 10, 10)
+        prompt_layout.setSpacing(8)
+
+        prompt_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        prompt_input_style = f"""
+            QPlainTextEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                padding: 6px;
+                font-size: 8pt; {ff}
+            }}
+            QPlainTextEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+
+        prompt_label = QLabel('提示词模板（可直接覆盖修改）')
+        prompt_label.setStyleSheet(prompt_label_style)
+        prompt_layout.addWidget(prompt_label)
+
+        prompt_action_row = QHBoxLayout()
+        prompt_action_row.addStretch()
+        self._restore_prompt_btn = QPushButton('恢复默认')
+        self._restore_prompt_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._restore_prompt_btn.setFixedWidth(88)
+        self._restore_prompt_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """)
+        self._restore_prompt_btn.clicked.connect(self._restore_default_prompt)
+        prompt_action_row.addWidget(self._restore_prompt_btn)
+        prompt_layout.addLayout(prompt_action_row)
+
+        self._prompt_input = QPlainTextEdit()
+        self._prompt_input.setPlaceholderText('可直接修改完整提示词模板')
+        self._prompt_input.setStyleSheet(prompt_input_style)
+        prompt_layout.addWidget(self._prompt_input, 1)
+
+        self._tabs.addTab(prompt_tab, '📝 提示词')
+
         cl.addWidget(self._tabs)
         main_layout.addWidget(container)
 
     def load_settings(self, ai_config):
         """从 config 加载 AI 设置"""
-        if ai_config.get('api_url'):
-            self._url_input.setText(ai_config['api_url'])
-        if ai_config.get('api_key'):
-            self._key_input.setText(ai_config['api_key'])
-        if ai_config.get('model'):
-            self._model_input.setText(ai_config['model'])
-        if ai_config.get('custom_prompt'):
-            self._prompt_input.setText(ai_config['custom_prompt'])
+        self._url_input.setText(ai_config.get('api_url', ''))
+        self._key_input.setText(ai_config.get('api_key', ''))
+        self._model_input.setText(ai_config.get('model', ''))
+        self._prompt_input.setPlainText(
+            normalize_prompt_template(ai_config.get('prompt_template') or ai_config.get('custom_prompt', ''))
+        )
+        self._test_result_label.setText('')
 
     def save_settings(self):
-        """返回当前 AI 设置（含自定义提示词）"""
+        """返回当前 AI 设置（含提示词模板）"""
         return {
             'api_url': self._url_input.text().strip(),
             'api_key': self._key_input.text().strip(),
             'model': self._model_input.text().strip(),
-            'custom_prompt': self._prompt_input.text().strip(),
+            'prompt_template': self._prompt_input.toPlainText().strip(),
         }
+
+    def _restore_default_prompt(self):
+        self._prompt_input.setPlainText(get_default_analysis_prompt())
+        self._test_result_label.setText('<span style="color:#5a6a7a;">已恢复默认提示词</span>')
+
+    def _save_current_settings(self):
+        settings = self.save_settings()
+        owner = self._owner_widget
+        if owner is not None and hasattr(owner, 'config') and hasattr(owner, '_save_config'):
+            owner.config['ai_settings'] = settings
+            owner._save_config()
+            self._test_result_label.setText('<span style="color:#27ae60;">✅ 已保存到 config.json</span>')
+            return
+        self._test_result_label.setText('<span style="color:#e74c3c;">保存失败：未找到主窗口</span>')
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1655,7 +1736,7 @@ class GoldAnalysisDialog(QDialog):
         api_url = self._url_input.text().strip()
         api_key = self._key_input.text().strip()
         model = self._model_input.text().strip()
-        custom_prompt = self._prompt_input.text().strip()
+        prompt_template = self._prompt_input.toPlainText().strip()
         if not api_url or not api_key or not model:
             t = self.theme_tokens
             self._result_browser.setHtml(
@@ -1669,7 +1750,7 @@ class GoldAnalysisDialog(QDialog):
         self._tabs.setCurrentIndex(0)
 
         self._analysis_thread = _GoldAnalysisThread(
-            api_url, api_key, model, custom_prompt
+            api_url, api_key, model, prompt_template
         )
         self._analysis_thread.progress_ready.connect(self._on_progress)
         self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
@@ -1747,19 +1828,19 @@ class _GoldAnalysisThread(QThread):
     result_ready = pyqtSignal(str)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, api_url, api_key, model, custom_prompt=''):
+    def __init__(self, api_url, api_key, model, prompt_template=''):
         super().__init__()
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
-        self.custom_prompt = custom_prompt
+        self.prompt_template = prompt_template
 
     def run(self):
         try:
             self.progress_ready.emit('⏬ 正在获取K线数据...')
             kline, kline_source = fetch_gold_kline(24)
             if not kline:
-                self.error_ready.emit('无法获取K线数据')
+                self.error_ready.emit('无法获取K线数据，请稍后重试')
                 return
 
             self.progress_ready.emit('📊 正在计算技术指标...')
@@ -1775,7 +1856,7 @@ class _GoldAnalysisThread(QThread):
             self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
             text = analyze_with_ai(
                 self.api_url, self.api_key, self.model,
-                kline, ind, self.custom_prompt,
+                kline, ind, self.prompt_template,
                 spot_price=spot_price, kline_source=kline_source
             )
             html = self._md_to_html(text)
@@ -1801,8 +1882,8 @@ class _GoldAnalysisThread(QThread):
         if spot_price > 0:
             source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">伦敦金现货价(新浪): {spot_price} 美元/盎司</p>'
             if kline_source and 'Yahoo' in kline_source:
-                spread = round(ind['current_price'] - spot_price, 2)
-                source_info += f'<p style="font-size:7.5pt;color:#e7c24a;">期货溢价: {spread} 美元（分析已自动校准至现货价）</p>'
+                diff_value = round(ind['current_price'] - spot_price, 2)
+                source_info += f'<p style="font-size:7.5pt;color:#e7c24a;">当前纽约金/COMEX期货与伦敦金现货价差: {diff_value} 美元（跨市场差异，仅供参考）</p>'
 
         return (
             f'{source_info}'
@@ -1820,28 +1901,36 @@ class _GoldAnalysisThread(QThread):
         import re
         lines = md_text.split('\n')
         html_lines = []
+        blank_pending = False
         for line in lines:
             stripped = line.strip()
+            if not stripped:
+                blank_pending = True
+                continue
             if stripped.startswith('### '):
-                html_lines.append(f'<h4>{stripped[4:]}</h4>')
+                html_lines.append(f'<h4 style="margin:10px 0 4px 0;">{stripped[4:]}</h4>')
             elif stripped.startswith('## '):
-                html_lines.append(f'<h3>{stripped[3:]}</h3>')
+                html_lines.append(f'<h3 style="margin:12px 0 6px 0;">{stripped[3:]}</h3>')
             elif stripped.startswith('# '):
-                html_lines.append(f'<h2>{stripped[2:]}</h2>')
+                html_lines.append(f'<h2 style="margin:12px 0 6px 0;">{stripped[2:]}</h2>')
             elif stripped == '---':
-                html_lines.append('<hr>')
+                html_lines.append('<hr style="margin:10px 0;">')
             elif stripped.startswith('- ') or stripped.startswith('* '):
                 content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
-                html_lines.append(f'<div style="margin-left:12px;">• {content}</div>')
+                margin_top = '8px' if blank_pending else '2px'
+                html_lines.append(f'<div style="margin:{margin_top} 0 0 12px; line-height:1.5;">• {content}</div>')
             elif re.match(r'^\d+\.\s', stripped):
                 content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
-                html_lines.append(f'<div style="margin-left:12px;">{content}</div>')
+                margin_top = '8px' if blank_pending else '2px'
+                html_lines.append(f'<div style="margin:{margin_top} 0 0 12px; line-height:1.5;">{content}</div>')
             elif stripped.startswith('> '):
                 content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
-                html_lines.append(f'<blockquote style="border-left:3px solid #4a9eff;padding-left:8px;color:#8a9aaa;">{content}</blockquote>')
+                html_lines.append(f'<blockquote style="border-left:3px solid #4a9eff;padding-left:8px;color:#8a9aaa;margin:8px 0; line-height:1.5;">{content}</blockquote>')
             else:
                 content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
-                html_lines.append(f'<p>{content}</p>' if stripped else '<br>')
+                margin_top = '8px' if blank_pending else '2px'
+                html_lines.append(f'<p style="margin:{margin_top} 0 0 0; line-height:1.55;">{content}</p>')
+            blank_pending = False
         return '\n'.join(html_lines)
 
 
@@ -1873,6 +1962,7 @@ class StockWidget(QWidget):
         self._drag_pos = None
         self._fetcher = None
         self._finished_fetchers = []
+        self._gold_analysis_dialog = None
 
         self._init_colors()
 
@@ -2351,14 +2441,22 @@ class StockWidget(QWidget):
 
     def _open_gold_analysis(self):
         """打开金价AI分析"""
+        if self._gold_analysis_dialog is not None and self._gold_analysis_dialog.isVisible():
+            self._gold_analysis_dialog.showNormal()
+            self._gold_analysis_dialog.raise_()
+            self._gold_analysis_dialog.activateWindow()
+            return
+
         dialog = GoldAnalysisDialog(self, dark_mode=self.dark_mode)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(lambda: setattr(self, '_gold_analysis_dialog', None))
         ai_config = self.config.get('ai_settings', {})
         dialog.load_settings(ai_config)
         screen = QApplication.primaryScreen().geometry()
         dialog.move(screen.center().x() - 280, screen.center().y() - 310)
-        dialog.exec_()
-        self.config['ai_settings'] = dialog.save_settings()
-        self._save_config()
+        dialog.show()
+        dialog.activateWindow()
+        self._gold_analysis_dialog = dialog
 
     def _refresh_all_rows(self):
         """刷新所有股票行的显示（用于重新构建界面）"""
@@ -2434,6 +2532,7 @@ class StockWidget(QWidget):
             config_data['font_size'] = self.base_font_size
             config_data['data_source'] = 'sina'
             config_data['visible_stocks'] = self.visible_symbols
+            config_data['ai_settings'] = self.config.get('ai_settings', {})
             if 'gold_premium' in self.config:
                 config_data['gold_premium'] = self.config['gold_premium']
             with open(config_path, 'w', encoding='utf-8') as f:

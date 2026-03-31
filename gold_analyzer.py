@@ -35,7 +35,7 @@ def fetch_gold_kline(datalen=24):
     优先使用新浪 hf_XAU（伦敦金现货）；若新浪K线不可用，回退到 Yahoo GC=F（COMEX期货）。
     返回 (candles, source_name):
         candles: list[dict]，每根 {'time', 'open', 'high', 'low', 'close', 'volume'}
-        source_name: str, '新浪伦敦金(hf_XAU)' 或 'Yahoo COMEX期货(GC=F)'
+        source_name: str, '新浪伦敦金(hf_XAU)'、'Yahoo COMEX期货(GC=F)' 或 ''
     """
     # 尝试新浪 K 线
     candles = _fetch_sina_kline(datalen)
@@ -43,7 +43,9 @@ def fetch_gold_kline(datalen=24):
         return candles, '新浪伦敦金(hf_XAU)'
     # 回退到 Yahoo
     candles = _fetch_yahoo_kline(datalen)
-    return candles, 'Yahoo COMEX期货(GC=F)'
+    if candles:
+        return candles, 'Yahoo COMEX期货(GC=F)'
+    return None, ''
 
 
 def _fetch_sina_kline(datalen):
@@ -82,32 +84,41 @@ def _fetch_sina_kline(datalen):
 
 def _fetch_yahoo_kline(datalen):
     """从 Yahoo Finance 获取 COMEX 黄金期货(GC=F) 60 分钟 K 线"""
-    url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F'
-    params = {'interval': '1h', 'range': '3d'}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    resp = requests.get(url, params=params, headers=headers, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F'
+        params = {'interval': '1h', 'range': '3d'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
 
-    result = data['chart']['result'][0]
-    ts = result['timestamp']
-    q = result['indicators']['quote'][0]
+        result_list = data.get('chart', {}).get('result') or []
+        if not result_list:
+            return None
+        result = result_list[0]
+        ts = result.get('timestamp') or []
+        quote_list = result.get('indicators', {}).get('quote') or []
+        if not ts or not quote_list:
+            return None
+        q = quote_list[0]
 
-    candles = []
-    for i, t in enumerate(ts):
-        o, h, l, c, v = q['open'][i], q['high'][i], q['low'][i], q['close'][i], q['volume'][i]
-        if c is None or c == 0:
-            continue
-        dt = datetime.datetime.fromtimestamp(t)
-        candles.append({
-            'time': dt.strftime('%m-%d %H:%M'),
-            'open': round(float(o), 2),
-            'high': round(float(h), 2),
-            'low': round(float(l), 2),
-            'close': round(float(c), 2),
-            'volume': int(v or 0),
-        })
-    return candles[-datalen:]
+        candles = []
+        for i, t in enumerate(ts):
+            o, h, l, c, v = q['open'][i], q['high'][i], q['low'][i], q['close'][i], q['volume'][i]
+            if c is None or c == 0:
+                continue
+            dt = datetime.datetime.fromtimestamp(t)
+            candles.append({
+                'time': dt.strftime('%m-%d %H:%M'),
+                'open': round(float(o), 2),
+                'high': round(float(h), 2),
+                'low': round(float(l), 2),
+                'close': round(float(c), 2),
+                'volume': int(v or 0),
+            })
+        return candles[-datalen:] if candles else None
+    except Exception:
+        return None
 
 
 # ──────────────── 技术指标计算（纯 Python） ────────────────
@@ -270,58 +281,97 @@ def calculate_indicators(kline_data):
 
 # ──────────────── AI 分析调用 ────────────────
 
-def build_analysis_prompt(kline_data, indicators, custom_prompt='', spot_price=0, kline_source=''):
-    """构造 AI 分析用的 prompt。custom_prompt 为用户自定义提示词（附加到末尾）。"""
+PROMPT_SOURCE_NOTE = '{{source_note}}'
+PROMPT_KLINE_TABLE = '{{kline_table}}'
+PROMPT_INDICATORS = '{{indicators_text}}'
+
+
+def get_default_analysis_prompt():
+    """返回默认的金价分析提示词模板。"""
+    return f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟K线数据和技术指标，提供一份简洁的分析报告。
+{PROMPT_SOURCE_NOTE}
+
+## K线数据（60分钟周期）
+{PROMPT_KLINE_TABLE}
+
+## 技术指标
+{PROMPT_INDICATORS}
+
+请用中文提供以下分析（使用Markdown格式）：
+1. **短期趋势判断**（多头/空头/震荡）及理由
+2. **关键支撑位和阻力位**（基于当前分析标的价格体系）
+3. **技术指标综合解读**（每个指标说明了什么）
+4. **具体买卖建议**（做多/做空/观望，入场价位，止损建议）
+5. **风险提示**
+
+要求：分析简明扼要，重点突出可操作性建议。所有价位以当前分析标的价格体系为准。不要用表格。"""
+
+
+def normalize_prompt_template(prompt_template=''):
+    """规范化用户保存的提示词模板，兼容旧的附加提示词写法。"""
+    text = (prompt_template or '').strip()
+    if not text:
+        return get_default_analysis_prompt()
+    if any(token in text for token in (PROMPT_SOURCE_NOTE, PROMPT_KLINE_TABLE, PROMPT_INDICATORS)):
+        return text
+    if '## K线数据（60分钟周期）' in text and '## 技术指标' in text:
+        return text
+    return get_default_analysis_prompt() + f'\n\n## 附加要求\n{text}'
+
+
+def render_prompt_template(prompt_template, source_note, kline_table, indicators_text):
+    """将提示词模板中的占位符替换为实际分析数据。"""
+    template = normalize_prompt_template(prompt_template)
+    return (template
+            .replace(PROMPT_SOURCE_NOTE, source_note)
+            .replace(PROMPT_KLINE_TABLE, kline_table)
+            .replace(PROMPT_INDICATORS, indicators_text))
+
+
+def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price=0, kline_source=''):
+    """构造 AI 分析用的 prompt。prompt_template 为用户可覆盖编辑的完整提示词模板。"""
     # K线表格
     kline_table = '| 时间 | 开盘 | 最高 | 最低 | 收盘 | 成交量 |\n|---|---|---|---|---|---|\n'
     for c in kline_data:
         kline_table += f"| {c['time']} | {c['open']} | {c['high']} | {c['low']} | {c['close']} | {c['volume']} |\n"
 
     ind = indicators
+    indicators_text = '\n'.join([
+        f"- MACD: DIF={ind['macd']['dif']}, DEA={ind['macd']['dea']}, MACD柱={ind['macd']['histogram']}",
+        f"- RSI(14): {ind['rsi']}",
+        f"- 布林带: 上轨={ind['bollinger']['upper']}, 中轨={ind['bollinger']['mid']}, 下轨={ind['bollinger']['lower']}",
+        f"- KDJ: K={ind['kdj']['k']}, D={ind['kdj']['d']}, J={ind['kdj']['j']}",
+        f"- MA5={ind['ma5']}, MA10={ind['ma10']}",
+        f"- ATR(14)={ind['atr']}",
+        f"- 近5根K线价格变化: {ind['price_change_5']}",
+    ])
 
     # 数据源说明
     source_note = ''
     if kline_source and 'Yahoo' in kline_source:
-        source_note = f'\n注意：K线数据来源为 {kline_source}，与伦敦金现货价格存在约30-40美元期货溢价。'
+        source_note = (
+            f'\n注意：K线数据来源为 {kline_source}，这属于纽约金/COMEX黄金期货价格体系，'
+            '与伦敦金现货并非同一市场，不能简单按固定溢价换算。'
+        )
         if spot_price > 0:
-            spread = round(ind['current_price'] - spot_price, 2)
-            source_note += f'\n当前K线收盘价 {ind["current_price"]}，伦敦金现货价 {spot_price}，期货溢价 {spread} 美元。'
-            source_note += '\n分析支撑/阻力位和买卖建议时，请参考伦敦金现货价格（即K线价格减去溢价）给出。'
+            diff_value = round(ind['current_price'] - spot_price, 2)
+            source_note += (
+                f'\n当前期货K线收盘价 {ind["current_price"]}，伦敦金现货价 {spot_price}，'
+                f'两者当前价差 {diff_value} 美元。'
+            )
+            source_note += '\n请将该价差视为跨市场差异，仅作参考，不要机械折算。'
+    elif spot_price > 0:
+        source_note = '\n当前分析K线与伦敦金现货属于同一价格体系。'
     if spot_price > 0:
         source_note += f'\n\n## 伦敦金(XAU/USD)实时现货价\n{spot_price} 美元/盎司'
 
-    prompt = f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟K线数据和技术指标，提供一份简洁的分析报告。
-{source_note}
-
-## K线数据（60分钟周期）
-{kline_table}
-
-## 技术指标
-- MACD: DIF={ind['macd']['dif']}, DEA={ind['macd']['dea']}, MACD柱={ind['macd']['histogram']}
-- RSI(14): {ind['rsi']}
-- 布林带: 上轨={ind['bollinger']['upper']}, 中轨={ind['bollinger']['mid']}, 下轨={ind['bollinger']['lower']}
-- KDJ: K={ind['kdj']['k']}, D={ind['kdj']['d']}, J={ind['kdj']['j']}
-- MA5={ind['ma5']}, MA10={ind['ma10']}
-- ATR(14)={ind['atr']}
-- 近5根K线价格变化: {ind['price_change_5']}
-
-请用中文提供以下分析（使用Markdown格式）：
-1. **短期趋势判断**（多头/空头/震荡）及理由
-2. **关键支撑位和阻力位**（基于伦敦金现货价）
-3. **技术指标综合解读**（每个指标说明了什么）
-4. **具体买卖建议**（做多/做空/观望，入场价位，止损建议）
-5. **风险提示**
-
-要求：分析简明扼要，重点突出可操作性建议。所有价位以伦敦金现货价为准。不要用表格。"""
-    if custom_prompt and custom_prompt.strip():
-        prompt += f'\n\n## 附加要求\n{custom_prompt.strip()}'
-    return prompt
+    return render_prompt_template(prompt_template, source_note, kline_table, indicators_text)
 
 
 def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
-                    custom_prompt='', spot_price=0, kline_source=''):
+                    prompt_template='', spot_price=0, kline_source=''):
     """调用 Anthropic 兼容接口进行金价分析，返回分析文本"""
-    prompt = build_analysis_prompt(kline_data, indicators, custom_prompt,
+    prompt = build_analysis_prompt(kline_data, indicators, prompt_template,
                                    spot_price, kline_source)
 
     # Anthropic Messages API
@@ -337,7 +387,7 @@ def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
         'messages': [{'role': 'user', 'content': prompt}],
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()
     data = resp.json()
 
