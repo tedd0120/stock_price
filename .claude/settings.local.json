@@ -15,7 +15,16 @@
       "Bash(then git:*)",
       "Bash(else echo:*)",
       "Bash(fi)",
-      "Bash(git -C \"P:/git_repos/stock_price\" status --short -- \"config.json\" \".gitignore\")"
+      "Bash(git -C \"P:/git_repos/stock_price\" status --short -- \"config.json\" \".gitignore\")",
+      "Bash(printf \"\\\\n---FINAL-STATUS---\\\\n\")",
+      "Bash(git -C \"$repo\" status --short)",
+      "Bash(git -C \"P:/git_repos/stock_price\" status --short)",
+      "Bash(printf \"\\\\n---BRANCH---\\\\n\")",
+      "Bash(git -C \"P:/git_repos/stock_price\" branch -vv)",
+      "Bash(printf \"\\\\n---REMOTE---\\\\n\")",
+      "Bash(git -C \"P:/git_repos/stock_price\" remote -v)",
+      "Bash(git -C \"P:/git_repos/stock_price\" fetch origin)",
+      "Bash(git -C \"P:/git_repos/stock_price\" push --force-with-lease origin main)"
     ]
   }
 }

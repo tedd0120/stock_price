@@ -1472,6 +1472,19 @@ class GoldAnalysisDialog(QDialog):
         key_row.addWidget(self._key_input)
         sl.addLayout(key_row)
 
+        # Twelve Data Key
+        td_key_row = QHBoxLayout()
+        td_key_lbl = QLabel('TD Key')
+        td_key_lbl.setFixedWidth(52)
+        td_key_lbl.setStyleSheet(setting_label_style)
+        self._td_key_input = QLineEdit()
+        self._td_key_input.setStyleSheet(input_style)
+        self._td_key_input.setEchoMode(QLineEdit.Password)
+        self._td_key_input.setPlaceholderText('Twelve Data API Key')
+        td_key_row.addWidget(td_key_lbl)
+        td_key_row.addWidget(self._td_key_input)
+        sl.addLayout(td_key_row)
+
         # Model
         model_row = QHBoxLayout()
         model_lbl = QLabel('Model')
@@ -1668,10 +1681,12 @@ class GoldAnalysisDialog(QDialog):
         cl.addWidget(self._tabs)
         main_layout.addWidget(container)
 
-    def load_settings(self, ai_config):
+    def load_settings(self, ai_config, gold_data_config=None):
         """从 config 加载 AI 设置"""
+        gold_data_config = gold_data_config or {}
         self._url_input.setText(ai_config.get('api_url', ''))
         self._key_input.setText(ai_config.get('api_key', ''))
+        self._td_key_input.setText(gold_data_config.get('twelvedata_api_key', ''))
         self._model_input.setText(ai_config.get('model', ''))
         self._prompt_input.setPlainText(
             normalize_prompt_template(ai_config.get('prompt_template') or ai_config.get('custom_prompt', ''))
@@ -1681,10 +1696,15 @@ class GoldAnalysisDialog(QDialog):
     def save_settings(self):
         """返回当前 AI 设置（含提示词模板）"""
         return {
-            'api_url': self._url_input.text().strip(),
-            'api_key': self._key_input.text().strip(),
-            'model': self._model_input.text().strip(),
-            'prompt_template': self._prompt_input.toPlainText().strip(),
+            'ai_settings': {
+                'api_url': self._url_input.text().strip(),
+                'api_key': self._key_input.text().strip(),
+                'model': self._model_input.text().strip(),
+                'prompt_template': self._prompt_input.toPlainText().strip(),
+            },
+            'gold_data_settings': {
+                'twelvedata_api_key': self._td_key_input.text().strip(),
+            },
         }
 
     def _restore_default_prompt(self):
@@ -1695,7 +1715,8 @@ class GoldAnalysisDialog(QDialog):
         settings = self.save_settings()
         owner = self._owner_widget
         if owner is not None and hasattr(owner, 'config') and hasattr(owner, '_save_config'):
-            owner.config['ai_settings'] = settings
+            owner.config['ai_settings'] = settings['ai_settings']
+            owner.config['gold_data_settings'] = settings['gold_data_settings']
             owner._save_config()
             self._test_result_label.setText('<span style="color:#27ae60;">✅ 已保存到 config.json</span>')
             return
@@ -1737,11 +1758,12 @@ class GoldAnalysisDialog(QDialog):
         api_key = self._key_input.text().strip()
         model = self._model_input.text().strip()
         prompt_template = self._prompt_input.toPlainText().strip()
-        if not api_url or not api_key or not model:
+        td_api_key = self._td_key_input.text().strip()
+        if not api_url or not api_key or not model or not td_api_key:
             t = self.theme_tokens
             self._result_browser.setHtml(
                 '<p style="color:#e74c3c; text-align:center; margin-top:40px;">'
-                '请先填写完整的 API URL、API Key 和 Model</p>'
+                '请先填写完整的 API URL、API Key、TD Key 和 Model</p>'
             )
             return
 
@@ -1750,7 +1772,7 @@ class GoldAnalysisDialog(QDialog):
         self._tabs.setCurrentIndex(0)
 
         self._analysis_thread = _GoldAnalysisThread(
-            api_url, api_key, model, prompt_template
+            api_url, api_key, model, prompt_template, td_api_key
         )
         self._analysis_thread.progress_ready.connect(self._on_progress)
         self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
@@ -1828,17 +1850,18 @@ class _GoldAnalysisThread(QThread):
     result_ready = pyqtSignal(str)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, api_url, api_key, model, prompt_template=''):
+    def __init__(self, api_url, api_key, model, prompt_template='', twelvedata_api_key=''):
         super().__init__()
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.prompt_template = prompt_template
+        self.twelvedata_api_key = twelvedata_api_key
 
     def run(self):
         try:
             self.progress_ready.emit('⏬ 正在获取K线数据...')
-            kline, kline_source = fetch_gold_kline(24)
+            kline, kline_source = fetch_gold_kline(24, self.twelvedata_api_key)
             if not kline:
                 self.error_ready.emit('无法获取K线数据，请稍后重试')
                 return
@@ -1868,15 +1891,18 @@ class _GoldAnalysisThread(QThread):
     def _build_raw_html(kline, ind, kline_source='', spot_price=0):
         """构建原始数据 HTML 表格"""
         rows = ''
-        for c in kline:
+        for candle, row in zip(kline, ind.get('series', [])):
             rows += (
-                f"<tr><td>{c['time']}</td>"
-                f"<td>{c['open']}</td><td>{c['high']}</td>"
-                f"<td>{c['low']}</td><td>{c['close']}</td>"
-                f"<td>{c['volume']}</td></tr>"
+                f"<tr><td>{candle['time']}</td>"
+                f"<td>{candle['open']}</td><td>{candle['high']}</td>"
+                f"<td>{candle['low']}</td><td>{candle['close']}</td>"
+                f"<td>{candle['volume']}</td><td>{row['macd_dif']}</td>"
+                f"<td>{row['macd_dea']}</td><td>{row['macd_hist']}</td>"
+                f"<td>{row['rsi']}</td><td>{row['boll_upper']}</td>"
+                f"<td>{row['boll_mid']}</td><td>{row['boll_lower']}</td>"
+                f"<td>{row['kdj_k']}</td><td>{row['kdj_d']}</td><td>{row['kdj_j']}</td>"
+                f"<td>{row['atr']}</td><td>{row['ma5']}</td><td>{row['ma10']}</td></tr>"
             )
-        import json
-        ind_text = json.dumps(ind, indent=2, ensure_ascii=False)
 
         source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
         if spot_price > 0:
@@ -1884,12 +1910,15 @@ class _GoldAnalysisThread(QThread):
 
         return (
             f'{source_info}'
-            '<h4>K线数据（60分钟）</h4>'
-            '<table style="width:100%;border-collapse:collapse;font-size:7.5pt;">'
+            '<h4>合并数据（60分钟）</h4>'
+            '<div style="overflow:auto; max-width:100%;">'
+            '<table style="width:max-content;border-collapse:collapse;font-size:7.5pt; white-space:nowrap;">'
             '<tr style="font-weight:600;border-bottom:1px solid #444;">'
-            '<td>时间</td><td>开盘</td><td>最高</td><td>最低</td><td>收盘</td><td>成交量</td></tr>'
-            f'{rows}</table><br>'
-            f'<h4>技术指标</h4><pre style="font-size:7.5pt;">{ind_text}</pre>'
+            '<td>时间</td><td>开盘</td><td>最高</td><td>最低</td><td>收盘</td><td>成交量</td>'
+            '<td>DIF</td><td>DEA</td><td>MACD柱</td><td>RSI</td>'
+            '<td>Boll上</td><td>Boll中</td><td>Boll下</td>'
+            '<td>K</td><td>D</td><td>J</td><td>ATR</td><td>MA5</td><td>MA10</td></tr>'
+            f'{rows}</table></div>'
         )
 
     @staticmethod
@@ -2448,7 +2477,8 @@ class StockWidget(QWidget):
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.destroyed.connect(lambda: setattr(self, '_gold_analysis_dialog', None))
         ai_config = self.config.get('ai_settings', {})
-        dialog.load_settings(ai_config)
+        gold_data_config = self.config.get('gold_data_settings', {})
+        dialog.load_settings(ai_config, gold_data_config)
         screen = QApplication.primaryScreen().geometry()
         dialog.move(screen.center().x() - 280, screen.center().y() - 310)
         dialog.show()
@@ -2530,6 +2560,7 @@ class StockWidget(QWidget):
             config_data['data_source'] = 'sina'
             config_data['visible_stocks'] = self.visible_symbols
             config_data['ai_settings'] = self.config.get('ai_settings', {})
+            config_data['gold_data_settings'] = self.config.get('gold_data_settings', {})
             if 'gold_premium' in self.config:
                 config_data['gold_premium'] = self.config['gold_premium']
             with open(config_path, 'w', encoding='utf-8') as f:

@@ -6,6 +6,9 @@ import datetime
 import requests
 
 
+TWELVEDATA_API_URL = 'https://api.twelvedata.com/time_series'
+
+
 # ──────────────── 数据抓取 ────────────────
 
 def _safe_float(val):
@@ -30,17 +33,50 @@ def fetch_london_gold_spot():
         return 0.0
 
 
-def fetch_gold_kline(datalen=24):
-    """获取伦敦金(XAU) 60 分钟 K 线数据。
-    仅使用新浪 XAU 数据源，不再回退到纽约金/COMEX 黄金期货。
+def fetch_gold_kline(datalen=24, twelvedata_api_key=''):
+    """获取伦敦金(XAU/USD) 60 分钟 K 线数据。
+    优先使用 Twelve Data 的 XAU/USD Gold Spot 小时K线。
     返回 (candles, source_name):
         candles: list[dict]，每根 {'time', 'open', 'high', 'low', 'close', 'volume'}
-        source_name: str, '新浪伦敦金(XAU)' 或 ''
+        source_name: str, 'Twelve Data XAU/USD Gold Spot' 或 ''
     """
-    candles = _fetch_sina_kline(datalen)
+    candles = _fetch_twelvedata_kline(datalen, twelvedata_api_key)
     if candles:
-        return candles, '新浪伦敦金(XAU)'
+        return candles, 'Twelve Data XAU/USD Gold Spot'
     return None, ''
+
+
+def _fetch_twelvedata_kline(datalen, api_key):
+    if not api_key:
+        return None
+    try:
+        params = {
+            'symbol': 'XAU/USD',
+            'interval': '1h',
+            'outputsize': datalen,
+            'timezone': 'Asia/Shanghai',
+            'apikey': api_key,
+        }
+        resp = requests.get(TWELVEDATA_API_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get('status') != 'ok':
+            return None
+        values = list(reversed(data.get('values') or []))
+        candles = []
+        for row in values:
+            dt = datetime.datetime.strptime(row['datetime'], '%Y-%m-%d %H:%M:%S')
+            candles.append({
+                'time': dt.strftime('%m-%d %H:%M'),
+                'open': _safe_float(row.get('open')),
+                'high': _safe_float(row.get('high')),
+                'low': _safe_float(row.get('low')),
+                'close': _safe_float(row.get('close')),
+                'volume': 0,
+            })
+        return candles[-datalen:] if candles else None
+    except Exception:
+        return None
 
 
 def _parse_sina_minline_rows(rows):
@@ -228,7 +264,7 @@ def calc_atr(highs, lows, closes, period=14):
 
 
 def calculate_indicators(kline_data):
-    """计算所有技术指标，返回指标摘要字典"""
+    """计算所有技术指标，返回最新摘要和完整序列"""
     closes = [c['close'] for c in kline_data]
     highs = [c['high'] for c in kline_data]
     lows = [c['low'] for c in kline_data]
@@ -241,49 +277,71 @@ def calculate_indicators(kline_data):
     ma5 = _sma(closes, 5)
     ma10 = _sma(closes, 10)
 
-    idx = len(kline_data) - 1  # 最新一根
+    idx = len(kline_data) - 1
+
+    series = []
+    for i, candle in enumerate(kline_data):
+        series.append({
+            'time': candle['time'],
+            'close': round(closes[i], 2),
+            'macd_dif': round(dif[i], 2),
+            'macd_dea': round(dea[i], 2),
+            'macd_hist': round(macd_hist[i], 2),
+            'rsi': round(rsi[i], 1),
+            'boll_upper': round(boll_upper[i], 2) if boll_upper[i] is not None else None,
+            'boll_mid': round(boll_mid[i], 2) if boll_mid[i] is not None else None,
+            'boll_lower': round(boll_lower[i], 2) if boll_lower[i] is not None else None,
+            'kdj_k': round(k_vals[i], 1),
+            'kdj_d': round(d_vals[i], 1),
+            'kdj_j': round(j_vals[i], 1),
+            'atr': round(atr[i], 2),
+            'ma5': round(ma5[i], 2) if ma5[i] is not None else None,
+            'ma10': round(ma10[i], 2) if ma10[i] is not None else None,
+        })
+
+    latest = series[idx]
     return {
         'current_price': closes[idx],
         'macd': {
-            'dif': round(dif[idx], 2),
-            'dea': round(dea[idx], 2),
-            'histogram': round(macd_hist[idx], 2),
+            'dif': latest['macd_dif'],
+            'dea': latest['macd_dea'],
+            'histogram': latest['macd_hist'],
         },
-        'rsi': round(rsi[idx], 1),
+        'rsi': latest['rsi'],
         'bollinger': {
-            'upper': round(boll_upper[idx], 2) if boll_upper[idx] else None,
-            'mid': round(boll_mid[idx], 2) if boll_mid[idx] else None,
-            'lower': round(boll_lower[idx], 2) if boll_lower[idx] else None,
+            'upper': latest['boll_upper'],
+            'mid': latest['boll_mid'],
+            'lower': latest['boll_lower'],
         },
         'kdj': {
-            'k': round(k_vals[idx], 1),
-            'd': round(d_vals[idx], 1),
-            'j': round(j_vals[idx], 1),
+            'k': latest['kdj_k'],
+            'd': latest['kdj_d'],
+            'j': latest['kdj_j'],
         },
-        'atr': round(atr[idx], 2),
-        'ma5': round(ma5[idx], 2) if ma5[idx] else None,
-        'ma10': round(ma10[idx], 2) if ma10[idx] else None,
-        # 近 5 根趋势
+        'atr': latest['atr'],
+        'ma5': latest['ma5'],
+        'ma10': latest['ma10'],
         'price_change_5': round(closes[idx] - closes[max(0, idx - 4)], 2),
+        'series': series,
     }
 
 
 # ──────────────── AI 分析调用 ────────────────
 
 PROMPT_SOURCE_NOTE = '{{source_note}}'
-PROMPT_KLINE_TABLE = '{{kline_table}}'
+PROMPT_COMBINED_TABLE = '{{combined_table}}'
 PROMPT_INDICATORS = '{{indicators_text}}'
 
 
 def get_default_analysis_prompt():
     """返回默认的金价分析提示词模板。"""
-    return f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟K线数据和技术指标，提供一份简洁的分析报告。
+    return f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟合并行情与技术指标数据，提供一份简洁的分析报告。
 {PROMPT_SOURCE_NOTE}
 
-## K线数据（60分钟周期）
-{PROMPT_KLINE_TABLE}
+## 合并数据（60分钟周期，含OHLC与技术指标）
+{PROMPT_COMBINED_TABLE}
 
-## 技术指标
+## 指标摘要
 {PROMPT_INDICATORS}
 
 请用中文提供以下分析（使用Markdown格式）：
@@ -301,48 +359,51 @@ def normalize_prompt_template(prompt_template=''):
     text = (prompt_template or '').strip()
     if not text:
         return get_default_analysis_prompt()
-    if any(token in text for token in (PROMPT_SOURCE_NOTE, PROMPT_KLINE_TABLE, PROMPT_INDICATORS)):
+    if any(token in text for token in (PROMPT_SOURCE_NOTE, PROMPT_COMBINED_TABLE, PROMPT_INDICATORS)):
         return text
-    if '## K线数据（60分钟周期）' in text and '## 技术指标' in text:
+    if '## 合并数据（60分钟周期，含OHLC与技术指标）' in text and '## 指标摘要' in text:
         return text
     return get_default_analysis_prompt() + f'\n\n## 附加要求\n{text}'
 
 
-def render_prompt_template(prompt_template, source_note, kline_table, indicators_text):
+def render_prompt_template(prompt_template, source_note, combined_table, indicators_text):
     """将提示词模板中的占位符替换为实际分析数据。"""
     template = normalize_prompt_template(prompt_template)
     return (template
             .replace(PROMPT_SOURCE_NOTE, source_note)
-            .replace(PROMPT_KLINE_TABLE, kline_table)
+            .replace(PROMPT_COMBINED_TABLE, combined_table)
             .replace(PROMPT_INDICATORS, indicators_text))
 
 
 def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price=0, kline_source=''):
     """构造 AI 分析用的 prompt。prompt_template 为用户可覆盖编辑的完整提示词模板。"""
-    # K线表格
-    kline_table = '| 时间 | 开盘 | 最高 | 最低 | 收盘 | 成交量 |\n|---|---|---|---|---|---|\n'
-    for c in kline_data:
-        kline_table += f"| {c['time']} | {c['open']} | {c['high']} | {c['low']} | {c['close']} | {c['volume']} |\n"
-
     ind = indicators
-    indicators_text = '\n'.join([
-        f"- MACD: DIF={ind['macd']['dif']}, DEA={ind['macd']['dea']}, MACD柱={ind['macd']['histogram']}",
-        f"- RSI(14): {ind['rsi']}",
-        f"- 布林带: 上轨={ind['bollinger']['upper']}, 中轨={ind['bollinger']['mid']}, 下轨={ind['bollinger']['lower']}",
-        f"- KDJ: K={ind['kdj']['k']}, D={ind['kdj']['d']}, J={ind['kdj']['j']}",
-        f"- MA5={ind['ma5']}, MA10={ind['ma10']}",
-        f"- ATR(14)={ind['atr']}",
+    latest_summary = '\n'.join([
+        f"- 最新 MACD: DIF={ind['macd']['dif']}, DEA={ind['macd']['dea']}, MACD柱={ind['macd']['histogram']}",
+        f"- 最新 RSI(14): {ind['rsi']}",
+        f"- 最新布林带: 上轨={ind['bollinger']['upper']}, 中轨={ind['bollinger']['mid']}, 下轨={ind['bollinger']['lower']}",
+        f"- 最新 KDJ: K={ind['kdj']['k']}, D={ind['kdj']['d']}, J={ind['kdj']['j']}",
+        f"- 最新 MA5={ind['ma5']}, MA10={ind['ma10']}",
+        f"- 最新 ATR(14)={ind['atr']}",
         f"- 近5根K线价格变化: {ind['price_change_5']}",
     ])
+    combined_lines = [
+        '| 时间 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | DIF | DEA | MACD柱 | RSI | Boll上 | Boll中 | Boll下 | K | D | J | ATR | MA5 | MA10 |',
+        '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+    ]
+    for candle, row in zip(kline_data, ind.get('series', [])):
+        combined_lines.append(
+            f"| {candle['time']} | {candle['open']} | {candle['high']} | {candle['low']} | {candle['close']} | {candle['volume']} | {row['macd_dif']} | {row['macd_dea']} | {row['macd_hist']} | {row['rsi']} | {row['boll_upper']} | {row['boll_mid']} | {row['boll_lower']} | {row['kdj_k']} | {row['kdj_d']} | {row['kdj_j']} | {row['atr']} | {row['ma5']} | {row['ma10']} |"
+        )
+    combined_table = '\n'.join(combined_lines)
 
-    # 数据源说明
     source_note = ''
     if kline_source:
         source_note = f'\n当前分析K线数据来源：{kline_source}。'
     if spot_price > 0:
         source_note += f'\n\n## 伦敦金(XAU/USD)实时现货价\n{spot_price} 美元/盎司'
 
-    return render_prompt_template(prompt_template, source_note, kline_table, indicators_text)
+    return render_prompt_template(prompt_template, source_note, combined_table, latest_summary)
 
 
 def _build_ai_headers(api_url, api_key):
