@@ -18,7 +18,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QCursor, QIcon, QPixmap
 )
-from stock_fetcher import StockFetcher, search_stocks, get_display_quote_code
+from stock_fetcher import StockFetcher, search_stocks, get_display_quote_code, _safe_float
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QLineEdit, QScrollArea, QWidget as QtQWidget,
@@ -1060,6 +1060,299 @@ class StockListDialog(QDialog):
             thread.deleteLater()
 
 
+class GoldPriceFetchThread(QThread):
+    """获取沪金、伦敦金、美元汇率数据的线程"""
+    data_ready = pyqtSignal(float, float, float)  # 沪金, 伦敦金, 汇率
+
+    def run(self):
+        try:
+            url = 'http://hq.sinajs.cn/list=nf_AU0,hf_XAU,fx_susdcny'
+            headers = {'Referer': 'https://finance.sina.com.cn/'}
+            resp = requests.get(url, headers=headers, timeout=8)
+            resp.encoding = 'gbk'
+            lines = resp.text.strip().split('\n')
+            shanghai = london = rate = 0.0
+            for line in lines:
+                eq_idx = line.index('=')
+                key = line[:eq_idx].rsplit('_', 1)[-1]
+                val = line[eq_idx + 2:-1]  # strip '"...'
+                parts = val.split(',')
+                if key == 'AU0' and len(parts) > 8:
+                    shanghai = _safe_float(parts[8])
+                elif key == 'XAU' and len(parts) > 0:
+                    london = _safe_float(parts[0])
+                elif key == 'susdcny' and len(parts) > 1:
+                    rate = _safe_float(parts[1])
+            self.data_ready.emit(shanghai, london, rate)
+        except Exception:
+            self.data_ready.emit(0.0, 0.0, 0.0)
+
+
+class GoldConverterDialog(QDialog):
+    """金价换算器对话框"""
+    TROY_OUNCE_TO_GRAM = 31.1035
+
+    def __init__(self, parent=None, dark_mode=True):
+        super().__init__(parent)
+        self.dark_mode = dark_mode
+        self.theme_tokens = get_theme_tokens(dark_mode)
+        self._drag_pos = None
+        self._updating = None  # which input is being edited
+        self.shanghai_gold = 0.0
+        self.london_gold = 0.0
+        self.usd_cny_rate = 0.0
+        self._fetch_thread = None
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(340, 350)
+
+        self._fade_animation = QPropertyAnimation(self, b'windowOpacity')
+        self._fade_animation.setDuration(150)
+        self._fade_animation.setStartValue(0.0)
+        self._fade_animation.setEndValue(1.0)
+
+        t = self.theme_tokens
+        ff = "font-family: 'Microsoft YaHei', sans-serif;"
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        container = QWidget()
+        container.setStyleSheet(f"""
+            QWidget {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 10px;
+                {ff}
+            }}
+        """)
+        cl = QVBoxLayout(container)
+        cl.setContentsMargins(16, 10, 16, 12)
+        cl.setSpacing(8)
+
+        # --- 标题栏 ---
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(6)
+        title_icon = QLabel('🥇')
+        title_icon.setStyleSheet(f'font-size: 14pt; {ff}')
+        title_label = QLabel('金价换算器')
+        title_label.setStyleSheet(
+            f"color: {t['text_strong']}; font-size: 10pt; font-weight: 600; {ff}"
+        )
+        title_bar.addWidget(title_icon)
+        title_bar.addWidget(title_label)
+        title_bar.addStretch()
+        close_btn = QLabel('✕')
+        close_btn.setStyleSheet(
+            f"color: {t['text_muted']}; font-size: 11pt; padding: 2px 6px; {ff}"
+        )
+        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        close_btn.mousePressEvent = lambda e: self._close_with_animation()
+        title_bar.addWidget(close_btn)
+        cl.addLayout(title_bar)
+
+        # --- 实时价格（仅伦敦金 + 汇率）---
+        price_group = QWidget()
+        price_group.setStyleSheet(
+            f"background-color: {t['panel_alt']}; border-radius: 6px; {ff}"
+        )
+        pl = QVBoxLayout(price_group)
+        pl.setContentsMargins(10, 8, 10, 8)
+        pl.setSpacing(4)
+
+        self._london_price_label = QLabel('伦敦金 (XAU)    -- 美元/盎司')
+        self._rate_label = QLabel('美元汇率         --')
+        for lbl in (self._london_price_label, self._rate_label):
+            lbl.setStyleSheet(
+                f"color: {t['text']}; font-size: 9pt; {ff}"
+            )
+            pl.addWidget(lbl)
+        cl.addWidget(price_group)
+
+        # --- 换算输入 ---
+        input_style = (
+            f"background-color: {t['panel_alt']}; color: {t['text_strong']}; "
+            f"border: 1px solid {t['border']}; border-radius: 4px; padding: 4px 8px; "
+            f"font-size: 10pt; {ff}"
+        )
+        label_style = f"color: {t['text']}; font-size: 9pt; {ff}"
+
+        # 伦敦金输入
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        lbl1 = QLabel('伦敦金')
+        lbl1.setFixedWidth(48)
+        lbl1.setStyleSheet(label_style)
+        self._london_input = QLineEdit()
+        self._london_input.setPlaceholderText('美元/盎司')
+        self._london_input.setStyleSheet(input_style)
+        row1.addWidget(lbl1)
+        row1.addWidget(self._london_input)
+        cl.addLayout(row1)
+
+        # 沪金输入
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        lbl2 = QLabel('沪金')
+        lbl2.setFixedWidth(48)
+        lbl2.setStyleSheet(label_style)
+        self._shanghai_input = QLineEdit()
+        self._shanghai_input.setPlaceholderText('元/克')
+        self._shanghai_input.setStyleSheet(input_style)
+        row2.addWidget(lbl2)
+        row2.addWidget(self._shanghai_input)
+        cl.addLayout(row2)
+
+        # 升贴水输入
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        lbl3 = QLabel('升贴水')
+        lbl3.setFixedWidth(48)
+        lbl3.setStyleSheet(label_style)
+        self._premium_input = QLineEdit()
+        self._premium_input.setPlaceholderText('元/克 (可选)')
+        self._premium_input.setStyleSheet(input_style)
+        row3.addWidget(lbl3)
+        row3.addWidget(self._premium_input)
+        cl.addLayout(row3)
+
+        # 银行积存金结果
+        row4 = QHBoxLayout()
+        row4.setSpacing(8)
+        lbl4 = QLabel('积存金')
+        lbl4.setFixedWidth(48)
+        lbl4.setStyleSheet(label_style)
+        self._bank_result = QLabel('-- 元/克')
+        self._bank_result.setStyleSheet(
+            f"color: {t['accent']}; font-size: 10pt; font-weight: 600; {ff}"
+        )
+        row4.addWidget(lbl4)
+        row4.addWidget(self._bank_result)
+        row4.addStretch()
+        cl.addLayout(row4)
+
+        self._london_input.textChanged.connect(self._on_london_input)
+        self._shanghai_input.textChanged.connect(self._on_shanghai_input)
+        self._premium_input.textChanged.connect(self._on_premium_input)
+
+        # --- 刷新按钮 ---
+        self._refresh_btn = QPushButton('🔄 刷新汇率')
+        self._refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 6px;
+                padding: 6px 0; font-size: 9pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {t['surface_pressed']};
+            }}
+        """)
+        self._refresh_btn.clicked.connect(self._fetch_data)
+        cl.addWidget(self._refresh_btn)
+
+        main_layout.addWidget(container)
+
+    def _recalc_bank_result(self):
+        """更新银行积存金 = 沪金 + 升贴水"""
+        sh = _safe_float(self._shanghai_input.text())
+        pr = _safe_float(self._premium_input.text())
+        if sh > 0:
+            self._bank_result.setText(f'{sh + pr:.2f} 元/克')
+        else:
+            self._bank_result.setText('-- 元/克')
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fade_animation.start()
+        self._fetch_data()
+
+    def _fetch_data(self):
+        if self._fetch_thread and self._fetch_thread.isRunning():
+            return
+        self._refresh_btn.setText('🔄 加载中...')
+        self._fetch_thread = GoldPriceFetchThread()
+        self._fetch_thread.data_ready.connect(self._on_data_ready)
+        self._fetch_thread.finished.connect(self._fetch_thread.deleteLater)
+        self._fetch_thread.finished.connect(lambda: setattr(self, '_fetch_thread', None))
+        self._fetch_thread.start()
+
+    def _on_data_ready(self, shanghai, london, rate):
+        self.shanghai_gold = shanghai
+        self.london_gold = london
+        self.usd_cny_rate = rate
+        self._refresh_btn.setText('🔄 刷新汇率')
+
+        if london > 0:
+            self._london_price_label.setText(f'伦敦金 (XAU)    {london:.2f} 美元/盎司')
+        else:
+            self._london_price_label.setText('伦敦金 (XAU)    -- 美元/盎司')
+        if rate > 0:
+            self._rate_label.setText(f'美元汇率         {rate:.4f}')
+        else:
+            self._rate_label.setText('美元汇率         --')
+
+        # 用实时伦敦金价格填充，自动触发沪金换算
+        if london > 0 and self._updating != 'london':
+            self._london_input.setText(f'{london:.2f}')
+
+    def _on_london_input(self, text):
+        if self._updating:
+            return
+        val = _safe_float(text)
+        self._updating = 'london'
+        if val > 0 and self.usd_cny_rate > 0:
+            shanghai = val * self.usd_cny_rate / self.TROY_OUNCE_TO_GRAM
+            self._shanghai_input.setText(f'{shanghai:.2f}')
+        else:
+            self._shanghai_input.clear()
+        self._updating = None
+        self._recalc_bank_result()
+
+    def _on_shanghai_input(self, text):
+        if self._updating:
+            return
+        val = _safe_float(text)
+        self._updating = 'shanghai'
+        if val > 0 and self.usd_cny_rate > 0:
+            london = val * self.TROY_OUNCE_TO_GRAM / self.usd_cny_rate
+            self._london_input.setText(f'{london:.2f}')
+        else:
+            self._london_input.clear()
+        self._updating = None
+        self._recalc_bank_result()
+
+    def _on_premium_input(self, text):
+        self._recalc_bank_result()
+
+    # --- 拖动 ---
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.y() < 35:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+        else:
+            self._drag_pos = None
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+
+    def _close_with_animation(self):
+        fade_out = QPropertyAnimation(self, b'windowOpacity')
+        fade_out.setDuration(100)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+        fade_out.finished.connect(self.close)
+        fade_out.start()
+        self._fade_out_anim = fade_out  # prevent GC
+
+
 class StockWidget(QWidget):
     """主悬浮窗组件"""
 
@@ -1466,6 +1759,10 @@ class StockWidget(QWidget):
         indices_action = menu.addAction('📊 指数显示设置')
         indices_action.triggered.connect(self._open_stock_settings)
 
+        # 金价换算器
+        gold_converter_action = menu.addAction('🥇 金价换算器')
+        gold_converter_action.triggered.connect(self._open_gold_converter)
+
         menu.addSeparator()
 
         # 退出
@@ -1539,6 +1836,22 @@ class StockWidget(QWidget):
             self.visible_symbols = dialog.result_symbols
             self._refresh_all_rows()
             self._save_config()
+
+    def _open_gold_converter(self):
+        """打开金价换算器"""
+        dialog = GoldConverterDialog(self, dark_mode=self.dark_mode)
+        premium = self.config.get('gold_premium', '')
+        if premium:
+            dialog._premium_input.setText(str(premium))
+        screen = QApplication.primaryScreen().geometry()
+        dialog.move(
+            screen.center().x() - 170,
+            screen.center().y() - 175
+        )
+        dialog.exec_()
+        # 保存升贴水
+        self.config['gold_premium'] = dialog._premium_input.text()
+        self._save_config()
 
     def _refresh_all_rows(self):
         """刷新所有股票行的显示（用于重新构建界面）"""
@@ -1614,6 +1927,8 @@ class StockWidget(QWidget):
             config_data['font_size'] = self.base_font_size
             config_data['data_source'] = 'sina'
             config_data['visible_stocks'] = self.visible_symbols
+            if 'gold_premium' in self.config:
+                config_data['gold_premium'] = self.config['gold_premium']
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(config_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
