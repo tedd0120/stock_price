@@ -1881,9 +1881,6 @@ class _GoldAnalysisThread(QThread):
         source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
         if spot_price > 0:
             source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">伦敦金现货价(新浪): {spot_price} 美元/盎司</p>'
-            if kline_source and 'Yahoo' in kline_source:
-                diff_value = round(ind['current_price'] - spot_price, 2)
-                source_info += f'<p style="font-size:7.5pt;color:#e7c24a;">当前纽约金/COMEX期货与伦敦金现货价差: {diff_value} 美元（跨市场差异，仅供参考）</p>'
 
         return (
             f'{source_info}'

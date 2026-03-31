@@ -31,92 +31,81 @@ def fetch_london_gold_spot():
 
 
 def fetch_gold_kline(datalen=24):
-    """获取黄金 60 分钟 K 线数据。
-    优先使用新浪 hf_XAU（伦敦金现货）；若新浪K线不可用，回退到 Yahoo GC=F（COMEX期货）。
+    """获取伦敦金(XAU) 60 分钟 K 线数据。
+    仅使用新浪 XAU 数据源，不再回退到纽约金/COMEX 黄金期货。
     返回 (candles, source_name):
         candles: list[dict]，每根 {'time', 'open', 'high', 'low', 'close', 'volume'}
-        source_name: str, '新浪伦敦金(hf_XAU)'、'Yahoo COMEX期货(GC=F)' 或 ''
+        source_name: str, '新浪伦敦金(XAU)' 或 ''
     """
-    # 尝试新浪 K 线
     candles = _fetch_sina_kline(datalen)
     if candles:
-        return candles, '新浪伦敦金(hf_XAU)'
-    # 回退到 Yahoo
-    candles = _fetch_yahoo_kline(datalen)
-    if candles:
-        return candles, 'Yahoo COMEX期货(GC=F)'
+        return candles, '新浪伦敦金(XAU)'
     return None, ''
 
 
+def _parse_sina_minline_rows(rows):
+    points = []
+    for row in rows or []:
+        if not row:
+            continue
+        try:
+            timestamp_text = row[-1]
+            price = _safe_float(row[1])
+            if not timestamp_text or price <= 0:
+                continue
+            dt = datetime.datetime.strptime(timestamp_text, '%Y-%m-%d %H:%M:%S')
+            points.append({'dt': dt, 'price': round(price, 2)})
+        except Exception:
+            continue
+    return points
+
+
+def _aggregate_minline_to_hourly(points, datalen):
+    buckets = {}
+    for point in points:
+        bucket = point['dt'].replace(minute=0, second=0, microsecond=0)
+        price = point['price']
+        if bucket not in buckets:
+            buckets[bucket] = {
+                'time': bucket.strftime('%m-%d %H:%M'),
+                'open': price,
+                'high': price,
+                'low': price,
+                'close': price,
+                'volume': 0,
+            }
+        else:
+            buckets[bucket]['high'] = max(buckets[bucket]['high'], price)
+            buckets[bucket]['low'] = min(buckets[bucket]['low'], price)
+            buckets[bucket]['close'] = price
+    candles = [buckets[key] for key in sorted(buckets.keys())]
+    return candles[-datalen:] if candles else None
+
+
 def _fetch_sina_kline(datalen):
-    """尝试从新浪获取伦敦金 K 线（多个接口尝试）"""
-    # 尝试1: 新浪国际期货分钟K线
+    """从新浪获取伦敦金(XAU)分时数据并聚合成 60 分钟 K 线。"""
     try:
-        url = 'https://stock.finance.sina.com.cn/futures/api/jsonp.php/callback/HF_MinKline.getMinKline'
-        params = {'symbol': 'XAU', 'scale': '60', 'datalen': str(datalen)}
+        url = 'https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_XAU_MIN=/GlobalFuturesService.getGlobalFuturesMinLine'
+        params = {
+            'symbol': 'XAU',
+            '_': f'{datetime.datetime.now().year}_{datetime.datetime.now().month}_{datetime.datetime.now().day}',
+            'source': 'web',
+        }
         headers = {
-            'Referer': 'https://finance.sina.com.cn/futures/quotes/XAU.shtml',
+            'Referer': 'https://finance.sina.com.cn/money/future/hf.html',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         }
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        text = resp.text
-        # 解析 JSONP
-        json_str = text.split('(', 1)[1].rstrip(')')
-        if json_str == 'null' or '"__ERROR"' in json_str:
-            raise ValueError('sina kline not available')
-        data = json.loads(json_str)
-        candles = []
-        for item in data:
-            candles.append({
-                'time': item.get('d', item.get('day', '')),
-                'open': _safe_float(item.get('o', item.get('open', 0))),
-                'high': _safe_float(item.get('h', item.get('high', 0))),
-                'low': _safe_float(item.get('l', item.get('low', 0))),
-                'close': _safe_float(item.get('c', item.get('close', 0))),
-                'volume': int(_safe_float(item.get('v', item.get('volume', 0)))),
-            })
-        if candles:
-            return candles[-datalen:]
-    except Exception:
-        pass
-    return None
-
-
-def _fetch_yahoo_kline(datalen):
-    """从 Yahoo Finance 获取 COMEX 黄金期货(GC=F) 60 分钟 K 线"""
-    try:
-        url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F'
-        params = {'interval': '1h', 'range': '3d'}
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         resp = requests.get(url, params=params, headers=headers, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-
-        result_list = data.get('chart', {}).get('result') or []
-        if not result_list:
+        text = resp.text
+        json_str = text[text.find('(') + 1:text.rfind(')')]
+        if not json_str or '"__ERROR"' in json_str:
             return None
-        result = result_list[0]
-        ts = result.get('timestamp') or []
-        quote_list = result.get('indicators', {}).get('quote') or []
-        if not ts or not quote_list:
+        data = json.loads(json_str)
+        points = _parse_sina_minline_rows(data.get('minLine_1d', []))
+        if not points:
             return None
-        q = quote_list[0]
-
-        candles = []
-        for i, t in enumerate(ts):
-            o, h, l, c, v = q['open'][i], q['high'][i], q['low'][i], q['close'][i], q['volume'][i]
-            if c is None or c == 0:
-                continue
-            dt = datetime.datetime.fromtimestamp(t)
-            candles.append({
-                'time': dt.strftime('%m-%d %H:%M'),
-                'open': round(float(o), 2),
-                'high': round(float(h), 2),
-                'low': round(float(l), 2),
-                'close': round(float(c), 2),
-                'volume': int(v or 0),
-            })
-        return candles[-datalen:] if candles else None
+        return _aggregate_minline_to_hourly(points, datalen)
     except Exception:
         return None
 
@@ -348,39 +337,79 @@ def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price
 
     # 数据源说明
     source_note = ''
-    if kline_source and 'Yahoo' in kline_source:
-        source_note = (
-            f'\n注意：K线数据来源为 {kline_source}，这属于纽约金/COMEX黄金期货价格体系，'
-            '与伦敦金现货并非同一市场，不能简单按固定溢价换算。'
-        )
-        if spot_price > 0:
-            diff_value = round(ind['current_price'] - spot_price, 2)
-            source_note += (
-                f'\n当前期货K线收盘价 {ind["current_price"]}，伦敦金现货价 {spot_price}，'
-                f'两者当前价差 {diff_value} 美元。'
-            )
-            source_note += '\n请将该价差视为跨市场差异，仅作参考，不要机械折算。'
-    elif spot_price > 0:
-        source_note = '\n当前分析K线与伦敦金现货属于同一价格体系。'
+    if kline_source:
+        source_note = f'\n当前分析K线数据来源：{kline_source}。'
     if spot_price > 0:
         source_note += f'\n\n## 伦敦金(XAU/USD)实时现货价\n{spot_price} 美元/盎司'
 
     return render_prompt_template(prompt_template, source_note, kline_table, indicators_text)
 
 
+def _build_ai_headers(api_url, api_key):
+    if 'openrouter.ai' in api_url:
+        return {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+        }
+    return {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': api_key,
+    }
+
+
+def _is_openrouter(api_url):
+    return 'openrouter.ai' in api_url
+
+
+def _extract_openrouter_text(data):
+    choices = data.get('choices', [])
+    if not choices:
+        return ''
+    message = choices[0].get('message', {})
+    content = message.get('content', '')
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                text_parts.append(item.get('text', ''))
+        return '\n'.join(part for part in text_parts if part)
+    return ''
+
+
+def _extract_anthropic_text(data):
+    content_blocks = data.get('content', [])
+    text_parts = []
+    for block in content_blocks:
+        if block.get('type') == 'text':
+            text_parts.append(block['text'])
+    return '\n'.join(text_parts)
+
+
 def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
                     prompt_template='', spot_price=0, kline_source=''):
-    """调用 Anthropic 兼容接口进行金价分析，返回分析文本"""
+    """调用 AI 接口进行金价分析，返回分析文本"""
     prompt = build_analysis_prompt(kline_data, indicators, prompt_template,
                                    spot_price, kline_source)
 
-    # Anthropic Messages API
+    if _is_openrouter(api_url):
+        url = f"{api_url.rstrip('/')}/v1/chat/completions"
+        headers = _build_ai_headers(api_url, api_key)
+        payload = {
+            'model': model,
+            'max_tokens': 2048,
+            'messages': [{'role': 'user', 'content': prompt}],
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        resp.raise_for_status()
+        data = resp.json()
+        text = _extract_openrouter_text(data)
+        return text if text else 'AI 未返回有效内容。'
+
     url = f"{api_url.rstrip('/')}/v1/messages"
-    headers = {
-        'Content-Type': 'application/json',
-        'x-api-key': api_key,
-        'anthropic-version': '2023-06-01',
-    }
+    headers = _build_ai_headers(api_url, api_key)
     payload = {
         'model': model,
         'max_tokens': 2048,
@@ -390,42 +419,35 @@ def analyze_with_ai(api_url, api_key, model, kline_data, indicators,
     resp = requests.post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()
     data = resp.json()
-
-    # 解析 Anthropic Messages 响应
-    content_blocks = data.get('content', [])
-    text_parts = []
-    for block in content_blocks:
-        if block.get('type') == 'text':
-            text_parts.append(block['text'])
-    return '\n'.join(text_parts) if text_parts else 'AI 未返回有效内容。'
+    text = _extract_anthropic_text(data)
+    return text if text else 'AI 未返回有效内容。'
 
 
 def test_api_connection(api_url, api_key, model):
     """测试 AI API 连通性，返回 (success: bool, message: str)"""
     try:
-        url = f"{api_url.rstrip('/')}/v1/messages"
-        headers = {
-            'Content-Type': 'application/json',
-            'x-api-key': api_key,
-            'anthropic-version': '2023-06-01',
-        }
+        headers = _build_ai_headers(api_url, api_key)
         payload = {
             'model': model,
             'max_tokens': 64,
             'messages': [{'role': 'user', 'content': '回复OK'}],
         }
+        if _is_openrouter(api_url):
+            url = f"{api_url.rstrip('/')}/v1/chat/completions"
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            text = _extract_openrouter_text(data)
+            if text.strip() or data.get('choices'):
+                return True, f'连接成功！模型: {model}'
+            return False, 'API 返回了空内容'
+
+        url = f"{api_url.rstrip('/')}/v1/messages"
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        # 检查是否有 text 或 thinking 内容
-        for block in data.get('content', []):
-            btype = block.get('type', '')
-            if btype == 'text' and block.get('text', '').strip():
-                return True, f'连接成功！模型: {data.get("model", model)}'
-            if btype == 'thinking' and block.get('thinking', '').strip():
-                return True, f'连接成功！模型: {data.get("model", model)}'
-        # 即使没有 text 内容，只要没报错就算连通
-        if data.get('content'):
+        text = _extract_anthropic_text(data)
+        if text.strip() or data.get('content'):
             return True, f'连接成功！模型: {data.get("model", model)}'
         return False, 'API 返回了空内容'
     except requests.exceptions.ConnectionError:
