@@ -10,11 +10,12 @@ import requests
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMenu, QAction,
     QWidgetAction, QSlider, QApplication, QSystemTrayIcon,
-    QListWidget, QListWidgetItem, QPushButton, QDialog, QMessageBox
+    QListWidget, QListWidgetItem, QPushButton, QDialog, QMessageBox,
+    QSizePolicy
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QPoint, QRect, QPropertyAnimation,
-    QEasingCurve, QParallelAnimationGroup
+    QEasingCurve, QParallelAnimationGroup, QEvent
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QCursor, QIcon, QPixmap
@@ -1366,11 +1367,12 @@ class GoldConverterDialog(QDialog):
 class GoldAnalysisDialog(QDialog):
     """金价AI分析对话框"""
 
+    _detached_threads = set()
+
     def __init__(self, parent=None, dark_mode=True):
         super().__init__(parent)
         self.dark_mode = dark_mode
         self.theme_tokens = get_theme_tokens(dark_mode)
-        self._drag_pos = None
         self._analysis_thread = None
         self._test_thread = None
         self._owner_widget = parent
@@ -1382,10 +1384,13 @@ class GoldAnalysisDialog(QDialog):
         self._status_message = ''
         self._error_message = ''
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowMinimizeButtonHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle('金价AI分析')
+        self.setWindowFlags(
+            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint
+        )
         self.setAttribute(Qt.WA_QuitOnClose, False)
-        self.setFixedSize(580, 650)
+        self.resize(580, 650)
+        self.setMinimumSize(560, 620)
 
         self._fade_animation = QPropertyAnimation(self, b'windowOpacity')
         self._fade_animation.setDuration(150)
@@ -1404,7 +1409,7 @@ class GoldAnalysisDialog(QDialog):
             QWidget#goldAnalysisContainer {{
                 background-color: {t['panel']};
                 border: 1px solid {t['border_soft']};
-                border-radius: 10px;
+                border-radius: 8px;
                 {ff}
             }}
         """)
@@ -1424,20 +1429,6 @@ class GoldAnalysisDialog(QDialog):
         title_bar.addWidget(title_icon)
         title_bar.addWidget(title_label)
         title_bar.addStretch()
-        min_btn = QLabel('—')
-        min_btn.setStyleSheet(
-            f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 6px; {ff}"
-        )
-        min_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        min_btn.mousePressEvent = lambda e: self.showMinimized()
-        title_bar.addWidget(min_btn)
-        close_btn = QLabel('✕')
-        close_btn.setStyleSheet(
-            f"color: {t['text_muted']}; font-size: 10pt; padding: 2px 4px; {ff}"
-        )
-        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        close_btn.mousePressEvent = lambda e: self._close_with_animation()
-        title_bar.addWidget(close_btn)
         cl.addLayout(title_bar)
 
         # --- AI 设置区 ---
@@ -1593,6 +1584,7 @@ class GoldAnalysisDialog(QDialog):
 
         # --- Tab 区域：分析结果 + 原始数据 ---
         self._tabs = QTabWidget()
+        self._tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._tabs.setStyleSheet(f"""
             QTabWidget::pane {{
                 border: 1px solid {t['border']};
@@ -1634,8 +1626,11 @@ class GoldAnalysisDialog(QDialog):
 
         self._followup_input = QPlainTextEdit()
         self._followup_input.setPlaceholderText('首轮分析完成后，可在这里继续追问')
-        self._followup_input.setFixedHeight(82)
+        self._followup_input.setMinimumHeight(82)
+        self._followup_input.setMaximumHeight(160)
+        self._followup_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._followup_input.setStyleSheet(followup_input_style)
+        self._followup_input.installEventFilter(self)
         self._followup_input.setEnabled(False)
         result_layout.addWidget(self._followup_input)
 
@@ -1738,7 +1733,7 @@ class GoldAnalysisDialog(QDialog):
 
         self._tabs.addTab(prompt_tab, '📝 提示词')
 
-        cl.addWidget(self._tabs)
+        cl.addWidget(self._tabs, 1)
         main_layout.addWidget(container)
 
     def load_settings(self, ai_config, gold_data_config=None):
@@ -1800,8 +1795,7 @@ class GoldAnalysisDialog(QDialog):
         self._test_result_label.setText('')
         self._test_thread = _ApiTestThread(api_url, api_key, model)
         self._test_thread.result_ready.connect(self._on_test_result)
-        self._test_thread.finished.connect(self._test_thread.deleteLater)
-        self._test_thread.finished.connect(lambda: setattr(self, '_test_thread', None))
+        self._test_thread.finished.connect(self._on_test_thread_finished)
         self._test_thread.start()
 
     def _on_test_result(self, success, msg):
@@ -1810,6 +1804,13 @@ class GoldAnalysisDialog(QDialog):
         color = '#27ae60' if success else '#e74c3c'
         icon = '✅' if success else '❌'
         self._test_result_label.setText(f'<span style="color:{color};">{icon} {msg}</span>')
+
+    def _on_test_thread_finished(self):
+        thread = self.sender()
+        if thread is not None:
+            thread.deleteLater()
+        if self._test_thread is thread:
+            self._test_thread = None
 
     # --- 分析逻辑 ---
 
@@ -1845,6 +1846,13 @@ class GoldAnalysisDialog(QDialog):
         )
         self._send_btn.setEnabled(can_send)
 
+    def eventFilter(self, watched, event):
+        if watched is self._followup_input and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+                self._send_followup()
+                return True
+        return super().eventFilter(watched, event)
+
     def _render_chat_history(self):
         if not self._chat_messages:
             if self._error_message:
@@ -1866,7 +1874,12 @@ class GoldAnalysisDialog(QDialog):
                 continue
             if role == 'assistant':
                 title = 'AI 分析'
-                body = _GoldAnalysisThread._md_to_html(content)
+                body = (
+                    f'<div style="color:{self.theme_tokens["text"]}; line-height:1.68; '
+                    f'font-size:8.8pt; font-family:\'{UI_FONT_FAMILY}\', \'{UI_FONT_FALLBACK}\', sans-serif;">'
+                    f'{_GoldAnalysisThread._md_to_html(content)}'
+                    '</div>'
+                )
                 bg = self.theme_tokens['panel_alt']
                 border = self.theme_tokens['border']
             else:
@@ -1922,9 +1935,7 @@ class GoldAnalysisDialog(QDialog):
         self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
         self._analysis_thread.result_ready.connect(self._on_result)
         self._analysis_thread.error_ready.connect(self._on_error)
-        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
-        self._analysis_thread.finished.connect(lambda: setattr(self, '_analysis_thread', None))
-        self._analysis_thread.finished.connect(lambda: self._set_request_in_progress(False))
+        self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
         self._analysis_thread.start()
 
     def _send_followup(self):
@@ -1954,9 +1965,7 @@ class GoldAnalysisDialog(QDialog):
         self._analysis_thread.raw_data_ready.connect(self._on_raw_data)
         self._analysis_thread.result_ready.connect(self._on_result)
         self._analysis_thread.error_ready.connect(self._on_error)
-        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
-        self._analysis_thread.finished.connect(lambda: setattr(self, '_analysis_thread', None))
-        self._analysis_thread.finished.connect(lambda: self._set_request_in_progress(False))
+        self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
         self._analysis_thread.start()
 
     def _on_progress(self, msg):
@@ -1993,20 +2002,80 @@ class GoldAnalysisDialog(QDialog):
         self._request_mode = None
         self._render_chat_history()
 
-    # --- 拖动 & 关闭 ---
+    def _on_analysis_thread_finished(self):
+        thread = self.sender()
+        if thread is not None:
+            thread.deleteLater()
+        if self._analysis_thread is thread:
+            self._analysis_thread = None
+        self._set_request_in_progress(False)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and event.y() < 35:
-            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+    # --- 关闭 ---
+
+    def closeEvent(self, event):
+        self._cleanup_threads()
+        super().closeEvent(event)
+
+    def _cleanup_threads(self):
+        self._cleanup_analysis_thread()
+        self._cleanup_test_thread()
+
+    def _cleanup_analysis_thread(self):
+        thread = self._analysis_thread
+        if thread is None:
+            return
+        self._analysis_thread = None
+        try:
+            thread.progress_ready.disconnect(self._on_progress)
+        except TypeError:
+            pass
+        try:
+            thread.raw_data_ready.disconnect(self._on_raw_data)
+        except TypeError:
+            pass
+        try:
+            thread.result_ready.disconnect(self._on_result)
+        except TypeError:
+            pass
+        try:
+            thread.error_ready.disconnect(self._on_error)
+        except TypeError:
+            pass
+        try:
+            thread.finished.disconnect(self._on_analysis_thread_finished)
+        except TypeError:
+            pass
+        self._detach_thread_for_cleanup(thread)
+
+    def _cleanup_test_thread(self):
+        thread = self._test_thread
+        if thread is None:
+            return
+        self._test_thread = None
+        try:
+            thread.result_ready.disconnect(self._on_test_result)
+        except TypeError:
+            pass
+        try:
+            thread.finished.disconnect(self._on_test_thread_finished)
+        except TypeError:
+            pass
+        self._detach_thread_for_cleanup(thread)
+
+    @classmethod
+    def _discard_detached_thread(cls, thread):
+        cls._detached_threads.discard(thread)
+
+    @classmethod
+    def _detach_thread_for_cleanup(cls, thread):
+        if thread is None:
+            return
+        if thread.isRunning():
+            cls._detached_threads.add(thread)
+            thread.finished.connect(lambda t=thread: cls._discard_detached_thread(t))
+            thread.finished.connect(thread.deleteLater)
         else:
-            self._drag_pos = None
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPos() - self._drag_pos)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
+            thread.deleteLater()
 
     def _close_with_animation(self):
         fade_out = QPropertyAnimation(self, b'windowOpacity')
@@ -2134,39 +2203,138 @@ class _GoldAnalysisThread(QThread):
     def _md_to_html(md_text):
         """简易 Markdown 转 HTML"""
         import re
+
+        if not md_text:
+            return ''
+
+        heading_styles = {
+            1: 'margin:0 0 10px 0; font-size:15pt; font-weight:700;',
+            2: 'margin:14px 0 8px 0; font-size:13pt; font-weight:700;',
+            3: 'margin:12px 0 6px 0; font-size:11pt; font-weight:700;',
+            4: 'margin:10px 0 6px 0; font-size:10pt; font-weight:600;',
+            5: 'margin:10px 0 4px 0; font-size:9.2pt; font-weight:600;',
+            6: 'margin:8px 0 4px 0; font-size:8.7pt; font-weight:600;',
+        }
+        html_blocks = []
+        paragraph_lines = []
+        unordered_items = []
+        ordered_items = []
+        ordered_start = 1
+        quote_lines = []
+
+        def _inline_md_to_html(text):
+            escaped = html.escape(text)
+            return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', escaped)
+
+        def _flush_paragraph():
+            nonlocal paragraph_lines
+            if paragraph_lines:
+                html_blocks.append(
+                    '<p style="margin:0 0 10px 0;">' + '<br>'.join(paragraph_lines) + '</p>'
+                )
+                paragraph_lines = []
+
+        def _flush_unordered_list():
+            nonlocal unordered_items
+            if unordered_items:
+                items = ''.join(
+                    f'<li style="margin:0 0 4px 0;">{item}</li>' for item in unordered_items
+                )
+                html_blocks.append(
+                    '<ul style="margin:6px 0 10px 0; padding-left:20px;">' + items + '</ul>'
+                )
+                unordered_items = []
+
+        def _flush_ordered_list():
+            nonlocal ordered_items, ordered_start
+            if ordered_items:
+                start_attr = f' start="{ordered_start}"' if ordered_start != 1 else ''
+                items = ''.join(
+                    f'<li style="margin:0 0 4px 0;">{item}</li>' for item in ordered_items
+                )
+                html_blocks.append(
+                    f'<ol{start_attr} style="margin:6px 0 10px 0; padding-left:22px;">{items}</ol>'
+                )
+                ordered_items = []
+                ordered_start = 1
+
+        def _flush_quote():
+            nonlocal quote_lines
+            if quote_lines:
+                html_blocks.append(
+                    '<blockquote style="margin:8px 0 10px 0; padding:4px 0 4px 12px; '
+                    'border-left:3px solid #4a9eff; color:#8a9aaa;">'
+                    + '<br>'.join(quote_lines)
+                    + '</blockquote>'
+                )
+                quote_lines = []
+
         lines = md_text.split('\n')
-        html_lines = []
-        blank_pending = False
         for line in lines:
             stripped = line.strip()
             if not stripped:
-                blank_pending = True
+                _flush_paragraph()
+                _flush_unordered_list()
+                _flush_ordered_list()
+                _flush_quote()
                 continue
-            if stripped.startswith('### '):
-                html_lines.append(f'<h4 style="margin:10px 0 4px 0;">{stripped[4:]}</h4>')
-            elif stripped.startswith('## '):
-                html_lines.append(f'<h3 style="margin:12px 0 6px 0;">{stripped[3:]}</h3>')
-            elif stripped.startswith('# '):
-                html_lines.append(f'<h2 style="margin:12px 0 6px 0;">{stripped[2:]}</h2>')
-            elif stripped == '---':
-                html_lines.append('<hr style="margin:10px 0;">')
-            elif stripped.startswith('- ') or stripped.startswith('* '):
-                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
-                margin_top = '8px' if blank_pending else '2px'
-                html_lines.append(f'<div style="margin:{margin_top} 0 0 12px; line-height:1.5;">• {content}</div>')
-            elif re.match(r'^\d+\.\s', stripped):
-                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
-                margin_top = '8px' if blank_pending else '2px'
-                html_lines.append(f'<div style="margin:{margin_top} 0 0 12px; line-height:1.5;">{content}</div>')
-            elif stripped.startswith('> '):
-                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped[2:])
-                html_lines.append(f'<blockquote style="border-left:3px solid #4a9eff;padding-left:8px;color:#8a9aaa;margin:8px 0; line-height:1.5;">{content}</blockquote>')
-            else:
-                content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
-                margin_top = '8px' if blank_pending else '2px'
-                html_lines.append(f'<p style="margin:{margin_top} 0 0 0; line-height:1.55;">{content}</p>')
-            blank_pending = False
-        return '\n'.join(html_lines)
+
+            heading_match = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+            if heading_match:
+                _flush_paragraph()
+                _flush_unordered_list()
+                _flush_ordered_list()
+                _flush_quote()
+                level = len(heading_match.group(1))
+                html_blocks.append(
+                    f'<h{level} style="{heading_styles[level]}">{_inline_md_to_html(heading_match.group(2))}</h{level}>'
+                )
+                continue
+
+            if re.match(r'^(-{3,}|\*{3,})$', stripped):
+                _flush_paragraph()
+                _flush_unordered_list()
+                _flush_ordered_list()
+                _flush_quote()
+                html_blocks.append('<hr style="margin:10px 0; border:none; border-top:1px solid #3a4a5a;">')
+                continue
+
+            unordered_match = re.match(r'^[-*]\s+(.*)$', stripped)
+            if unordered_match:
+                _flush_paragraph()
+                _flush_ordered_list()
+                _flush_quote()
+                unordered_items.append(_inline_md_to_html(unordered_match.group(1)))
+                continue
+
+            ordered_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
+            if ordered_match:
+                _flush_paragraph()
+                _flush_unordered_list()
+                _flush_quote()
+                if not ordered_items:
+                    ordered_start = int(ordered_match.group(1))
+                ordered_items.append(_inline_md_to_html(ordered_match.group(2)))
+                continue
+
+            quote_match = re.match(r'^>\s?(.*)$', stripped)
+            if quote_match:
+                _flush_paragraph()
+                _flush_unordered_list()
+                _flush_ordered_list()
+                quote_lines.append(_inline_md_to_html(quote_match.group(1)))
+                continue
+
+            _flush_unordered_list()
+            _flush_ordered_list()
+            _flush_quote()
+            paragraph_lines.append(_inline_md_to_html(stripped))
+
+        _flush_paragraph()
+        _flush_unordered_list()
+        _flush_ordered_list()
+        _flush_quote()
+        return '\n'.join(html_blocks)
 
 
 class StockWidget(QWidget):
