@@ -3,10 +3,39 @@
 """
 import json
 import datetime
+import re
 import requests
 
 
 TWELVEDATA_API_URL = 'https://api.twelvedata.com/time_series'
+
+GOLD_ANALYSIS_MODES = {
+    '24h_hourly': {
+        'interval': '1h',
+        'outputsize': 24,
+        'time_format': '%m-%d %H:%M',
+        'period_text': '近24小时（60分钟周期）',
+        'combined_title': '合并数据（60分钟周期，含OHLC与技术指标）',
+        'raw_title': '合并数据（60分钟周期）',
+        'ui_label': '近24小时（小时K）',
+    },
+    '30d_daily': {
+        'interval': '1day',
+        'outputsize': 30,
+        'time_format': '%Y-%m-%d',
+        'period_text': '近30日（日线周期）',
+        'combined_title': '合并数据（日线周期，含OHLC与技术指标）',
+        'raw_title': '合并数据（日线周期）',
+        'ui_label': '近30日（日K）',
+    },
+}
+
+
+def get_gold_analysis_mode_config(analysis_mode='24h_hourly'):
+    key = analysis_mode if analysis_mode in GOLD_ANALYSIS_MODES else '24h_hourly'
+    config = dict(GOLD_ANALYSIS_MODES[key])
+    config['key'] = key
+    return config
 
 
 # ──────────────── 数据抓取 ────────────────
@@ -33,27 +62,30 @@ def fetch_london_gold_spot():
         return 0.0
 
 
-def fetch_gold_kline(datalen=24, twelvedata_api_key=''):
-    """获取伦敦金(XAU/USD) 60 分钟 K 线数据。
-    优先使用 Twelve Data 的 XAU/USD Gold Spot 小时K线。
+def fetch_gold_kline(datalen=None, twelvedata_api_key='', analysis_mode='24h_hourly'):
+    """获取伦敦金(XAU/USD) K 线数据。
+    优先使用 Twelve Data 的 XAU/USD Gold Spot K线。
     返回 (candles, source_name):
         candles: list[dict]，每根 {'time', 'open', 'high', 'low', 'close', 'volume'}
         source_name: str, 'Twelve Data XAU/USD Gold Spot' 或 ''
     """
-    candles = _fetch_twelvedata_kline(datalen, twelvedata_api_key)
+    mode_config = get_gold_analysis_mode_config(analysis_mode)
+    outputsize = datalen or mode_config['outputsize']
+    candles = _fetch_twelvedata_kline(outputsize, twelvedata_api_key, analysis_mode=mode_config['key'])
     if candles:
         return candles, 'Twelve Data XAU/USD Gold Spot'
     return None, ''
 
 
-def _fetch_twelvedata_kline(datalen, api_key):
+def _fetch_twelvedata_kline(datalen, api_key, analysis_mode='24h_hourly'):
     if not api_key:
         return None
+    mode_config = get_gold_analysis_mode_config(analysis_mode)
     try:
         params = {
             'symbol': 'XAU/USD',
-            'interval': '1h',
-            'outputsize': datalen,
+            'interval': mode_config['interval'],
+            'outputsize': datalen or mode_config['outputsize'],
             'timezone': 'Asia/Shanghai',
             'apikey': api_key,
         }
@@ -65,16 +97,23 @@ def _fetch_twelvedata_kline(datalen, api_key):
         values = list(reversed(data.get('values') or []))
         candles = []
         for row in values:
-            dt = datetime.datetime.strptime(row['datetime'], '%Y-%m-%d %H:%M:%S')
+            dt_text = (row.get('datetime') or '').strip()
+            if not dt_text:
+                continue
+            if ' ' in dt_text:
+                dt = datetime.datetime.strptime(dt_text, '%Y-%m-%d %H:%M:%S')
+            else:
+                dt = datetime.datetime.strptime(dt_text, '%Y-%m-%d')
             candles.append({
-                'time': dt.strftime('%m-%d %H:%M'),
+                'time': dt.strftime(mode_config['time_format']),
                 'open': _safe_float(row.get('open')),
                 'high': _safe_float(row.get('high')),
                 'low': _safe_float(row.get('low')),
                 'close': _safe_float(row.get('close')),
                 'volume': 0,
             })
-        return candles[-datalen:] if candles else None
+        outputsize = datalen or mode_config['outputsize']
+        return candles[-outputsize:] if candles else None
     except Exception:
         return None
 
@@ -331,14 +370,16 @@ def calculate_indicators(kline_data):
 PROMPT_SOURCE_NOTE = '{{source_note}}'
 PROMPT_COMBINED_TABLE = '{{combined_table}}'
 PROMPT_INDICATORS = '{{indicators_text}}'
+PROMPT_PERIOD_TEXT = '{{period_text}}'
+PROMPT_COMBINED_TITLE = '{{combined_title}}'
 
 
 def get_default_analysis_prompt():
     """返回默认的金价分析提示词模板。"""
-    return f"""你是一位专业的黄金市场分析师。请根据以下黄金过去约24小时的60分钟合并行情与技术指标数据，提供一份简洁的分析报告。
+    return f"""你是一位专业的黄金市场分析师。请根据以下黄金{PROMPT_PERIOD_TEXT}的合并行情与技术指标数据，提供一份简洁的分析报告。
 {PROMPT_SOURCE_NOTE}
 
-## 合并数据（60分钟周期，含OHLC与技术指标）
+## {PROMPT_COMBINED_TITLE}
 {PROMPT_COMBINED_TABLE}
 
 ## 指标摘要
@@ -359,24 +400,49 @@ def normalize_prompt_template(prompt_template=''):
     text = (prompt_template or '').strip()
     if not text:
         return get_default_analysis_prompt()
-    if any(token in text for token in (PROMPT_SOURCE_NOTE, PROMPT_COMBINED_TABLE, PROMPT_INDICATORS)):
+
+    text = re.sub(
+        r'请根据以下黄金.+?的合并行情与技术指标数据',
+        f'请根据以下黄金{PROMPT_PERIOD_TEXT}的合并行情与技术指标数据',
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r'##\s*合并数据（.*?）',
+        f'## {PROMPT_COMBINED_TITLE}',
+        text,
+        count=1,
+    )
+
+    if any(token in text for token in (
+        PROMPT_SOURCE_NOTE,
+        PROMPT_COMBINED_TABLE,
+        PROMPT_INDICATORS,
+        PROMPT_PERIOD_TEXT,
+        PROMPT_COMBINED_TITLE,
+    )):
         return text
-    if '## 合并数据（60分钟周期，含OHLC与技术指标）' in text and '## 指标摘要' in text:
+    if '## 指标摘要' in text and '## 合并数据（' in text:
         return text
     return get_default_analysis_prompt() + f'\n\n## 附加要求\n{text}'
 
 
-def render_prompt_template(prompt_template, source_note, combined_table, indicators_text):
+def render_prompt_template(prompt_template, source_note, combined_table, indicators_text,
+                           period_text, combined_title):
     """将提示词模板中的占位符替换为实际分析数据。"""
     template = normalize_prompt_template(prompt_template)
     return (template
             .replace(PROMPT_SOURCE_NOTE, source_note)
             .replace(PROMPT_COMBINED_TABLE, combined_table)
-            .replace(PROMPT_INDICATORS, indicators_text))
+            .replace(PROMPT_INDICATORS, indicators_text)
+            .replace(PROMPT_PERIOD_TEXT, period_text)
+            .replace(PROMPT_COMBINED_TITLE, combined_title))
 
 
-def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price=0, kline_source=''):
+def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price=0, kline_source='',
+                          analysis_mode='24h_hourly'):
     """构造 AI 分析用的 prompt。prompt_template 为用户可覆盖编辑的完整提示词模板。"""
+    mode_config = get_gold_analysis_mode_config(analysis_mode)
     ind = indicators
     latest_summary = '\n'.join([
         f"- 最新 MACD: DIF={ind['macd']['dif']}, DEA={ind['macd']['dea']}, MACD柱={ind['macd']['histogram']}",
@@ -403,7 +469,14 @@ def build_analysis_prompt(kline_data, indicators, prompt_template='', spot_price
     if spot_price > 0:
         source_note += f'\n\n## 伦敦金(XAU/USD)实时现货价\n{spot_price} 美元/盎司'
 
-    return render_prompt_template(prompt_template, source_note, combined_table, latest_summary)
+    return render_prompt_template(
+        prompt_template,
+        source_note,
+        combined_table,
+        latest_summary,
+        mode_config['period_text'],
+        mode_config['combined_title'],
+    )
 
 
 def _build_ai_headers(api_url, api_key):

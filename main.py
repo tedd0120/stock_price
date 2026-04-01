@@ -29,7 +29,9 @@ def load_config():
         "refresh_interval": 2,
         "opacity": 0.85,
         "ai_settings": {},
-        "gold_data_settings": {},
+        "gold_data_settings": {
+            "analysis_mode": "24h_hourly"
+        },
     }
 
     def normalize_config_symbols(config):

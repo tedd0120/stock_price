@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMenu, QAction,
     QWidgetAction, QSlider, QApplication, QSystemTrayIcon,
     QListWidget, QListWidgetItem, QPushButton, QDialog, QMessageBox,
-    QSizePolicy
+    QSizePolicy, QComboBox, QSplitter, QGridLayout
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QPoint, QRect, QPropertyAnimation,
@@ -32,7 +32,11 @@ from gold_analyzer import (
     fetch_gold_kline, fetch_london_gold_spot,
     calculate_indicators, analyze_with_ai,
     test_api_connection, get_default_analysis_prompt,
-    normalize_prompt_template, build_analysis_prompt
+    normalize_prompt_template, build_analysis_prompt,
+    get_gold_analysis_mode_config, GOLD_ANALYSIS_MODES,
+    PROMPT_SOURCE_NOTE, PROMPT_COMBINED_TABLE,
+    PROMPT_INDICATORS, PROMPT_PERIOD_TEXT,
+    PROMPT_COMBINED_TITLE
 )
 
 UI_FONT_FAMILY = 'Microsoft YaHei UI'
@@ -1428,15 +1432,13 @@ class GoldAnalysisDialog(QDialog):
         )
         title_bar.addWidget(title_icon)
         title_bar.addWidget(title_label)
+        self._header_status_label = QLabel('')
+        self._header_status_label.setStyleSheet(
+            f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        )
+        title_bar.addWidget(self._header_status_label)
         title_bar.addStretch()
         cl.addLayout(title_bar)
-
-        # --- AI 设置区 ---
-        settings_group = QWidget()
-        settings_group.setStyleSheet(f"{ff}")
-        sl = QVBoxLayout(settings_group)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(4)
 
         setting_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
         input_style = (
@@ -1446,66 +1448,7 @@ class GoldAnalysisDialog(QDialog):
             f"font-size: 8pt; {ff}"
         )
 
-        # URL
-        url_row = QHBoxLayout()
-        url_lbl = QLabel('API URL')
-        url_lbl.setFixedWidth(52)
-        url_lbl.setStyleSheet(setting_label_style)
-        self._url_input = QLineEdit()
-        self._url_input.setStyleSheet(input_style)
-        self._url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
-        url_row.addWidget(url_lbl)
-        url_row.addWidget(self._url_input)
-        sl.addLayout(url_row)
-
-        # Key
-        key_row = QHBoxLayout()
-        key_lbl = QLabel('API Key')
-        key_lbl.setFixedWidth(52)
-        key_lbl.setStyleSheet(setting_label_style)
-        self._key_input = QLineEdit()
-        self._key_input.setStyleSheet(input_style)
-        self._key_input.setEchoMode(QLineEdit.Password)
-        self._key_input.setPlaceholderText('sk-...')
-        key_row.addWidget(key_lbl)
-        key_row.addWidget(self._key_input)
-        sl.addLayout(key_row)
-
-        # Twelve Data Key
-        td_key_row = QHBoxLayout()
-        td_key_lbl = QLabel('TD Key')
-        td_key_lbl.setFixedWidth(52)
-        td_key_lbl.setStyleSheet(setting_label_style)
-        self._td_key_input = QLineEdit()
-        self._td_key_input.setStyleSheet(input_style)
-        self._td_key_input.setEchoMode(QLineEdit.Password)
-        self._td_key_input.setPlaceholderText('Twelve Data API Key')
-        td_key_row.addWidget(td_key_lbl)
-        td_key_row.addWidget(self._td_key_input)
-        sl.addLayout(td_key_row)
-
-        # Model
-        model_row = QHBoxLayout()
-        model_lbl = QLabel('Model')
-        model_lbl.setFixedWidth(52)
-        model_lbl.setStyleSheet(setting_label_style)
-        self._model_input = QLineEdit()
-        self._model_input.setStyleSheet(input_style)
-        self._model_input.setPlaceholderText('minimax-m2.7')
-        model_row.addWidget(model_lbl)
-        model_row.addWidget(self._model_input)
-        sl.addLayout(model_row)
-
-        cl.addWidget(settings_group)
-
-        # --- 按钮行：保存 + 连通性测试 + 开始分析 ---
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-
-        self._save_btn = QPushButton('💾 Save')
-        self._save_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._save_btn.setFixedWidth(80)
-        self._save_btn.setStyleSheet(f"""
+        button_style = f"""
             QPushButton {{
                 background-color: {t['surface']}; color: {t['text']};
                 border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
@@ -1517,38 +1460,9 @@ class GoldAnalysisDialog(QDialog):
             QPushButton:disabled {{
                 color: {t['text_muted']};
             }}
-        """)
-        self._save_btn.clicked.connect(self._save_current_settings)
-        btn_row.addWidget(self._save_btn)
+        """
 
-        self._test_btn = QPushButton('🔗 测试连通')
-        self._test_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._test_btn.setFixedWidth(100)
-        self._test_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {t['surface']}; color: {t['text']};
-                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
-                font-size: 8pt; {ff}
-            }}
-            QPushButton:hover {{
-                background-color: {t['surface_hover']};
-            }}
-            QPushButton:disabled {{
-                color: {t['text_muted']};
-            }}
-        """)
-        self._test_btn.clicked.connect(self._test_connection)
-        btn_row.addWidget(self._test_btn)
-
-        # 连通性测试结果标签
-        self._test_result_label = QLabel('')
-        self._test_result_label.setStyleSheet(f"font-size: 7.5pt; {ff}")
-        btn_row.addWidget(self._test_result_label)
-        btn_row.addStretch()
-
-        self._analyze_btn = QPushButton('🔍 开始分析')
-        self._analyze_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._analyze_btn.setStyleSheet(f"""
+        primary_button_style = f"""
             QPushButton {{
                 background-color: {t['accent']}; color: #ffffff;
                 border: none; border-radius: 5px; padding: 6px;
@@ -1563,10 +1477,7 @@ class GoldAnalysisDialog(QDialog):
             QPushButton:disabled {{
                 background-color: {t['surface']}; color: {t['text_muted']};
             }}
-        """)
-        self._analyze_btn.clicked.connect(self._start_analysis)
-        btn_row.addWidget(self._analyze_btn)
-        cl.addLayout(btn_row)
+        """
 
         followup_input_style = f"""
             QPlainTextEdit {{
@@ -1605,11 +1516,140 @@ class GoldAnalysisDialog(QDialog):
             }}
         """)
 
-        # Tab 1: 对话结果
+        # Tab 1: 设置
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(10, 10, 10, 10)
+        settings_layout.setSpacing(8)
+
+        settings_group = QWidget()
+        settings_group.setStyleSheet(f"{ff}")
+        sl = QVBoxLayout(settings_group)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(4)
+
+        url_row = QHBoxLayout()
+        url_lbl = QLabel('API URL')
+        url_lbl.setFixedWidth(52)
+        url_lbl.setStyleSheet(setting_label_style)
+        self._url_input = QLineEdit()
+        self._url_input.setStyleSheet(input_style)
+        self._url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
+        url_row.addWidget(url_lbl)
+        url_row.addWidget(self._url_input)
+        sl.addLayout(url_row)
+
+        key_row = QHBoxLayout()
+        key_lbl = QLabel('API Key')
+        key_lbl.setFixedWidth(52)
+        key_lbl.setStyleSheet(setting_label_style)
+        self._key_input = QLineEdit()
+        self._key_input.setStyleSheet(input_style)
+        self._key_input.setEchoMode(QLineEdit.Password)
+        self._key_input.setPlaceholderText('sk-...')
+        key_row.addWidget(key_lbl)
+        key_row.addWidget(self._key_input)
+        sl.addLayout(key_row)
+
+        td_key_row = QHBoxLayout()
+        td_key_lbl = QLabel('TD Key')
+        td_key_lbl.setFixedWidth(52)
+        td_key_lbl.setStyleSheet(setting_label_style)
+        self._td_key_input = QLineEdit()
+        self._td_key_input.setStyleSheet(input_style)
+        self._td_key_input.setEchoMode(QLineEdit.Password)
+        self._td_key_input.setPlaceholderText('Twelve Data API Key')
+        td_key_row.addWidget(td_key_lbl)
+        td_key_row.addWidget(self._td_key_input)
+        sl.addLayout(td_key_row)
+
+        model_row = QHBoxLayout()
+        model_lbl = QLabel('Model')
+        model_lbl.setFixedWidth(52)
+        model_lbl.setStyleSheet(setting_label_style)
+        self._model_input = QLineEdit()
+        self._model_input.setStyleSheet(input_style)
+        self._model_input.setPlaceholderText('minimax-m2.7')
+        model_row.addWidget(model_lbl)
+        model_row.addWidget(self._model_input)
+        sl.addLayout(model_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        mode_lbl = QLabel('周期')
+        mode_lbl.setFixedWidth(52)
+        mode_lbl.setStyleSheet(setting_label_style)
+        self._analysis_mode_combo = QComboBox()
+        self._analysis_mode_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {t['surface']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 18px;
+            }}
+        """)
+        for mode_key in ('24h_hourly', '30d_daily'):
+            mode_config = GOLD_ANALYSIS_MODES[mode_key]
+            self._analysis_mode_combo.addItem(mode_config['ui_label'], mode_key)
+        mode_row.addWidget(mode_lbl)
+        mode_row.addWidget(self._analysis_mode_combo, 1)
+        sl.addLayout(mode_row)
+
+        settings_layout.addWidget(settings_group)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+
+        self._settings_save_btn = QPushButton('💾 Save')
+        self._settings_save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._settings_save_btn.setFixedWidth(80)
+        self._settings_save_btn.setStyleSheet(button_style)
+        self._settings_save_btn.clicked.connect(self._save_current_settings)
+        btn_row.addWidget(self._settings_save_btn)
+
+        self._test_btn = QPushButton('🔗 测试连通')
+        self._test_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._test_btn.setFixedWidth(100)
+        self._test_btn.setStyleSheet(button_style)
+        self._test_btn.clicked.connect(self._test_connection)
+        btn_row.addWidget(self._test_btn)
+
+        self._test_result_label = QLabel('')
+        self._test_result_label.setStyleSheet(f"font-size: 7.5pt; {ff}")
+        btn_row.addWidget(self._test_result_label)
+        btn_row.addStretch()
+        settings_layout.addLayout(btn_row)
+        settings_layout.addStretch()
+
+        self._tabs.addTab(settings_tab, '⚙️ 设置')
+
+        # Tab 2: 对话结果
         result_tab = QWidget()
         result_layout = QVBoxLayout(result_tab)
-        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setContentsMargins(10, 10, 10, 10)
         result_layout.setSpacing(8)
+
+        result_header_row = QHBoxLayout()
+        result_header_row.setSpacing(8)
+        self._analysis_meta_label = QLabel('当前分析周期：近24小时（小时K）｜模型：未设置')
+        self._analysis_meta_label.setStyleSheet(
+            f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        )
+        result_header_row.addWidget(self._analysis_meta_label)
+        result_header_row.addStretch()
+
+        self._analyze_btn = QPushButton('🔍 开始分析')
+        self._analyze_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._analyze_btn.setStyleSheet(primary_button_style)
+        self._analyze_btn.clicked.connect(self._start_analysis)
+        result_header_row.addWidget(self._analyze_btn)
+        result_layout.addLayout(result_header_row)
 
         self._result_browser = QTextBrowser()
         self._result_browser.setOpenExternalLinks(False)
@@ -1622,19 +1662,17 @@ class GoldAnalysisDialog(QDialog):
                 font-size: 8.5pt; {ff}
             }}
         """)
-        result_layout.addWidget(self._result_browser, 1)
 
         self._followup_input = QPlainTextEdit()
         self._followup_input.setPlaceholderText('首轮分析完成后，可在这里继续追问')
-        self._followup_input.setMinimumHeight(82)
-        self._followup_input.setMaximumHeight(160)
-        self._followup_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._followup_input.setMinimumHeight(72)
+        self._followup_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._followup_input.setStyleSheet(followup_input_style)
         self._followup_input.installEventFilter(self)
         self._followup_input.setEnabled(False)
-        result_layout.addWidget(self._followup_input)
 
         followup_row = QHBoxLayout()
+        followup_row.setContentsMargins(0, 0, 0, 0)
         followup_row.addStretch()
         self._send_btn = QPushButton('发送')
         self._send_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -1659,7 +1697,34 @@ class GoldAnalysisDialog(QDialog):
         self._send_btn.clicked.connect(self._send_followup)
         self._followup_input.textChanged.connect(self._update_send_button_state)
         followup_row.addWidget(self._send_btn)
-        result_layout.addLayout(followup_row)
+
+        followup_panel = QWidget()
+        followup_panel_layout = QVBoxLayout(followup_panel)
+        followup_panel_layout.setContentsMargins(0, 0, 0, 0)
+        followup_panel_layout.setSpacing(6)
+        followup_panel_layout.addWidget(self._followup_input, 1)
+        followup_panel_layout.addLayout(followup_row)
+
+        self._result_splitter = QSplitter(Qt.Vertical)
+        self._result_splitter.setChildrenCollapsible(False)
+        self._result_splitter.setHandleWidth(8)
+        self._result_splitter.setStyleSheet(f"""
+            QSplitter::handle:vertical {{
+                background-color: {t['surface']};
+                border-top: 1px solid {t['border']};
+                border-bottom: 1px solid {t['border']};
+                margin: 2px 0;
+            }}
+            QSplitter::handle:vertical:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """)
+        self._result_splitter.addWidget(self._result_browser)
+        self._result_splitter.addWidget(followup_panel)
+        self._result_splitter.setStretchFactor(0, 1)
+        self._result_splitter.setStretchFactor(1, 0)
+        self._result_splitter.setSizes([420, 120])
+        result_layout.addWidget(self._result_splitter, 1)
 
         self._tabs.addTab(result_tab, '💬 分析对话')
         self._render_chat_history()
@@ -1707,24 +1772,62 @@ class GoldAnalysisDialog(QDialog):
         prompt_label.setStyleSheet(prompt_label_style)
         prompt_layout.addWidget(prompt_label)
 
-        prompt_action_row = QHBoxLayout()
-        prompt_action_row.addStretch()
-        self._restore_prompt_btn = QPushButton('恢复默认')
-        self._restore_prompt_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._restore_prompt_btn.setFixedWidth(88)
-        self._restore_prompt_btn.setStyleSheet(f"""
+        variable_button_style = f"""
             QPushButton {{
                 background-color: {t['surface']}; color: {t['text']};
-                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
-                font-size: 8pt; {ff}
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 4px 8px;
+                font-size: 7.8pt; {ff}
             }}
             QPushButton:hover {{
                 background-color: {t['surface_hover']};
             }}
-        """)
+        """
+
+        prompt_toolbar = QHBoxLayout()
+        prompt_toolbar.setSpacing(8)
+        variable_label = QLabel('变量一键插入')
+        variable_label.setStyleSheet(prompt_label_style)
+        prompt_toolbar.addWidget(variable_label)
+        prompt_toolbar.addStretch()
+
+        self._prompt_save_btn = QPushButton('💾 Save')
+        self._prompt_save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._prompt_save_btn.setFixedWidth(80)
+        self._prompt_save_btn.setStyleSheet(button_style)
+        self._prompt_save_btn.clicked.connect(self._save_current_settings)
+        prompt_toolbar.addWidget(self._prompt_save_btn)
+
+        self._restore_prompt_btn = QPushButton('恢复默认')
+        self._restore_prompt_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._restore_prompt_btn.setFixedWidth(88)
+        self._restore_prompt_btn.setStyleSheet(button_style)
         self._restore_prompt_btn.clicked.connect(self._restore_default_prompt)
-        prompt_action_row.addWidget(self._restore_prompt_btn)
-        prompt_layout.addLayout(prompt_action_row)
+        prompt_toolbar.addWidget(self._restore_prompt_btn)
+        prompt_layout.addLayout(prompt_toolbar)
+
+        variable_grid = QGridLayout()
+        variable_grid.setHorizontalSpacing(6)
+        variable_grid.setVerticalSpacing(6)
+        self._prompt_variable_buttons = []
+        variable_items = [
+            ('数据来源', PROMPT_SOURCE_NOTE),
+            ('原始表格', PROMPT_COMBINED_TABLE),
+            ('指标摘要', PROMPT_INDICATORS),
+            ('周期说明', PROMPT_PERIOD_TEXT),
+            ('数据标题', PROMPT_COMBINED_TITLE),
+        ]
+        for index, (label, token) in enumerate(variable_items):
+            btn = QPushButton(label)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setMinimumWidth(88)
+            btn.setStyleSheet(variable_button_style)
+            btn.clicked.connect(lambda _, value=token: self._insert_prompt_variable(value))
+            variable_grid.addWidget(btn, index // 3, index % 3)
+            self._prompt_variable_buttons.append(btn)
+        variable_grid.setColumnStretch(0, 1)
+        variable_grid.setColumnStretch(1, 1)
+        variable_grid.setColumnStretch(2, 1)
+        prompt_layout.addLayout(variable_grid)
 
         self._prompt_input = QPlainTextEdit()
         self._prompt_input.setPlaceholderText('可直接修改完整提示词模板')
@@ -1732,6 +1835,10 @@ class GoldAnalysisDialog(QDialog):
         prompt_layout.addWidget(self._prompt_input, 1)
 
         self._tabs.addTab(prompt_tab, '📝 提示词')
+
+        self._analysis_mode_combo.currentIndexChanged.connect(self._refresh_analysis_meta)
+        self._model_input.textChanged.connect(self._refresh_analysis_meta)
+        self._refresh_analysis_meta()
 
         cl.addWidget(self._tabs, 1)
         main_layout.addWidget(container)
@@ -1743,10 +1850,16 @@ class GoldAnalysisDialog(QDialog):
         self._key_input.setText(ai_config.get('api_key', ''))
         self._td_key_input.setText(gold_data_config.get('twelvedata_api_key', ''))
         self._model_input.setText(ai_config.get('model', ''))
+        mode_key = gold_data_config.get('analysis_mode', '24h_hourly')
+        mode_index = self._analysis_mode_combo.findData(mode_key)
+        if mode_index >= 0:
+            self._analysis_mode_combo.setCurrentIndex(mode_index)
         self._prompt_input.setPlainText(
             normalize_prompt_template(ai_config.get('prompt_template') or ai_config.get('custom_prompt', ''))
         )
         self._test_result_label.setText('')
+        self._set_header_status('')
+        self._refresh_analysis_meta()
 
     def save_settings(self):
         """返回当前 AI 设置（含提示词模板）"""
@@ -1759,23 +1872,47 @@ class GoldAnalysisDialog(QDialog):
             },
             'gold_data_settings': {
                 'twelvedata_api_key': self._td_key_input.text().strip(),
+                'analysis_mode': self._analysis_mode_combo.currentData() or '24h_hourly',
             },
         }
 
+    def _set_header_status(self, text, color=None):
+        color = color or self.theme_tokens['text_muted']
+        if text:
+            self._header_status_label.setText(f'<span style="color:{color};">{text}</span>')
+        else:
+            self._header_status_label.setText('')
+
+    def _refresh_analysis_meta(self):
+        mode_key = self._analysis_mode_combo.currentData() or '24h_hourly'
+        mode_config = get_gold_analysis_mode_config(mode_key)
+        model = self._model_input.text().strip() or '未设置'
+        self._analysis_meta_label.setText(
+            f"当前分析周期：{mode_config['ui_label']}｜模型：{model}"
+        )
+
+    def _insert_prompt_variable(self, token):
+        cursor = self._prompt_input.textCursor()
+        cursor.insertText(token)
+        self._prompt_input.setTextCursor(cursor)
+        self._prompt_input.setFocus()
+
     def _restore_default_prompt(self):
         self._prompt_input.setPlainText(get_default_analysis_prompt())
-        self._test_result_label.setText('<span style="color:#5a6a7a;">已恢复默认提示词</span>')
+        self._set_header_status('已恢复默认提示词', '#5a6a7a')
 
     def _save_current_settings(self):
         settings = self.save_settings()
         owner = self._owner_widget
+        self._set_header_status('')
         if owner is not None and hasattr(owner, 'config') and hasattr(owner, '_save_config'):
             owner.config['ai_settings'] = settings['ai_settings']
             owner.config['gold_data_settings'] = settings['gold_data_settings']
             owner._save_config()
-            self._test_result_label.setText('<span style="color:#27ae60;">✅ 已保存到 config.json</span>')
+            saved_at = datetime.datetime.now().strftime('%H:%M:%S')
+            self._set_header_status(f'已保存 {saved_at}', '#27ae60')
             return
-        self._test_result_label.setText('<span style="color:#e74c3c;">保存失败：未找到主窗口</span>')
+        self._set_header_status('保存失败：未找到主窗口', '#e74c3c')
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1830,6 +1967,7 @@ class GoldAnalysisDialog(QDialog):
         self._error_message = ''
         self._followup_input.clear()
         self._render_chat_history()
+        self._refresh_analysis_meta()
         self._update_send_button_state()
 
     def _set_request_in_progress(self, in_progress):
@@ -1921,14 +2059,17 @@ class GoldAnalysisDialog(QDialog):
             self._render_chat_history()
             return
 
+        analysis_mode = self._analysis_mode_combo.currentData() or '24h_hourly'
+
         self._reset_chat_session()
         self._request_mode = 'initial'
-        self._tabs.setCurrentIndex(0)
+        self._tabs.setCurrentIndex(1)
         self._set_request_in_progress(True)
         self._analysis_thread = _GoldAnalysisThread(
             api_url, api_key, model,
             prompt_template=prompt_template,
             twelvedata_api_key=td_api_key,
+            analysis_mode=analysis_mode,
             follow_up_mode=False,
         )
         self._analysis_thread.progress_ready.connect(self._on_progress)
@@ -1951,7 +2092,7 @@ class GoldAnalysisDialog(QDialog):
         self._chat_messages.append({'role': 'user', 'content': followup_text})
         self._followup_input.clear()
         self._render_chat_history()
-        self._tabs.setCurrentIndex(0)
+        self._tabs.setCurrentIndex(1)
         messages = [self._analysis_context_message] + list(self._chat_messages)
         self._set_request_in_progress(True)
         self._analysis_thread = _GoldAnalysisThread(
@@ -2110,7 +2251,7 @@ class _GoldAnalysisThread(QThread):
     error_ready = pyqtSignal(str)
 
     def __init__(self, api_url, api_key, model, prompt_template='', twelvedata_api_key='',
-                 messages=None, follow_up_mode=False):
+                 messages=None, follow_up_mode=False, analysis_mode='24h_hourly'):
         super().__init__()
         self.api_url = api_url
         self.api_key = api_key
@@ -2119,6 +2260,7 @@ class _GoldAnalysisThread(QThread):
         self.twelvedata_api_key = twelvedata_api_key
         self.messages = messages or []
         self.follow_up_mode = follow_up_mode
+        self.analysis_mode = analysis_mode or '24h_hourly'
 
     def run(self):
         try:
@@ -2130,8 +2272,12 @@ class _GoldAnalysisThread(QThread):
                 self.result_ready.emit({'reply': text})
                 return
 
-            self.progress_ready.emit('⏬ 正在获取K线数据...')
-            kline, kline_source = fetch_gold_kline(24, self.twelvedata_api_key)
+            mode_config = get_gold_analysis_mode_config(self.analysis_mode)
+            self.progress_ready.emit(f"⏬ 正在获取{mode_config['ui_label']}数据...")
+            kline, kline_source = fetch_gold_kline(
+                twelvedata_api_key=self.twelvedata_api_key,
+                analysis_mode=mode_config['key'],
+            )
             if not kline:
                 self.error_ready.emit('无法获取K线数据，请稍后重试')
                 return
@@ -2141,12 +2287,19 @@ class _GoldAnalysisThread(QThread):
 
             self.progress_ready.emit('💰 获取伦敦金现货价...')
             spot_price = fetch_london_gold_spot()
-            self.raw_data_ready.emit(self._build_raw_html(kline, ind, kline_source, spot_price))
+            self.raw_data_ready.emit(
+                self._build_raw_html(
+                    kline, ind, kline_source, spot_price,
+                    analysis_mode=mode_config['key'],
+                )
+            )
 
             self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
             analysis_prompt = build_analysis_prompt(
                 kline, ind, self.prompt_template,
-                spot_price=spot_price, kline_source=kline_source
+                spot_price=spot_price,
+                kline_source=kline_source,
+                analysis_mode=mode_config['key'],
             )
             analysis_context_message = {'role': 'user', 'content': analysis_prompt}
             text = analyze_with_ai(
@@ -2156,6 +2309,9 @@ class _GoldAnalysisThread(QThread):
                 'reply': text,
                 'analysis_context_message': analysis_context_message,
                 'kline_context': {
+                    'analysis_mode': mode_config['key'],
+                    'mode_label': mode_config['ui_label'],
+                    'period_text': mode_config['period_text'],
                     'kline': kline,
                     'indicators': ind,
                     'spot_price': spot_price,
@@ -2166,8 +2322,9 @@ class _GoldAnalysisThread(QThread):
             self.error_ready.emit(str(e))
 
     @staticmethod
-    def _build_raw_html(kline, ind, kline_source='', spot_price=0):
+    def _build_raw_html(kline, ind, kline_source='', spot_price=0, analysis_mode='24h_hourly'):
         """构建原始数据 HTML 表格"""
+        mode_config = get_gold_analysis_mode_config(analysis_mode)
         rows = ''
         for candle, row in zip(kline, ind.get('series', [])):
             rows += (
@@ -2182,13 +2339,14 @@ class _GoldAnalysisThread(QThread):
                 f"<td>{row['atr']}</td><td>{row['ma5']}</td><td>{row['ma10']}</td></tr>"
             )
 
-        source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
+        source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">分析周期: {mode_config["period_text"]}</p>'
+        source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
         if spot_price > 0:
             source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">伦敦金现货价(新浪): {spot_price} 美元/盎司</p>'
 
         return (
             f'{source_info}'
-            '<h4>合并数据（60分钟）</h4>'
+            f'<h4>{mode_config["raw_title"]}</h4>'
             '<div style="overflow:auto; max-width:100%;">'
             '<table style="width:max-content;border-collapse:collapse;font-size:7.5pt; white-space:nowrap;">'
             '<tr style="font-weight:600;border-bottom:1px solid #444;">'
