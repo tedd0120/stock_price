@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMenu, QAction,
     QWidgetAction, QSlider, QApplication, QSystemTrayIcon,
     QListWidget, QListWidgetItem, QPushButton, QDialog, QMessageBox,
-    QSizePolicy, QComboBox, QSplitter, QGridLayout
+    QSizePolicy, QComboBox, QSplitter, QGridLayout, QCheckBox
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QPoint, QRect, QPropertyAnimation,
@@ -32,7 +32,8 @@ from gold_analyzer import (
     fetch_gold_kline, fetch_london_gold_spot,
     calculate_indicators, analyze_with_ai,
     test_api_connection, get_default_analysis_prompt,
-    normalize_prompt_template, build_analysis_prompt,
+    get_default_summarizer_prompt, normalize_prompt_template, build_analysis_prompt,
+    normalize_ai_settings, build_summarizer_prompt,
     get_gold_analysis_mode_config, GOLD_ANALYSIS_MODES,
     PROMPT_SOURCE_NOTE, PROMPT_COMBINED_TABLE,
     PROMPT_INDICATORS, PROMPT_PERIOD_TEXT,
@@ -1379,6 +1380,8 @@ class GoldAnalysisDialog(QDialog):
         self.theme_tokens = get_theme_tokens(dark_mode)
         self._analysis_thread = None
         self._test_thread = None
+        self._test_target_key = None
+        self._analyst_card_state = []
         self._owner_widget = parent
         self._chat_messages = []
         self._analysis_context_message = None
@@ -1387,6 +1390,19 @@ class GoldAnalysisDialog(QDialog):
         self._request_mode = None
         self._status_message = ''
         self._error_message = ''
+        self._header_status_timer = QTimer(self)
+        self._header_status_timer.setSingleShot(True)
+        self._header_status_timer.timeout.connect(lambda: self._set_header_status(''))
+        self._current_analyst_results = []
+        self._analyst_report_expanded = {}
+        self._settings_section_state = {
+            'config': True,
+            'analysts': True,
+            'prompts': False,
+        }
+        self._settings_sections = {}
+        self._raw_html_content = ''
+        self._raw_meta = {}
 
         self.setWindowTitle('金价AI分析')
         self.setWindowFlags(
@@ -1407,7 +1423,8 @@ class GoldAnalysisDialog(QDialog):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        container = QWidget()
+        self._container = QWidget()
+        container = self._container
         container.setObjectName('goldAnalysisContainer')
         container.setStyleSheet(f"""
             QWidget#goldAnalysisContainer {{
@@ -1440,13 +1457,22 @@ class GoldAnalysisDialog(QDialog):
         title_bar.addStretch()
         cl.addLayout(title_bar)
 
-        setting_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
-        input_style = (
-            f"background-color: transparent; color: {t['text_strong']}; "
-            f"border: none; border-bottom: 1px solid {t['border']}; "
-            f"border-radius: 0px; padding: 2px 5px; "
-            f"font-size: 8pt; {ff}"
+        setting_label_style = (
+            f"color: {t['text']}; font-size: 7.8pt; font-weight: 600; {ff}"
         )
+        input_style = f"""
+            QLineEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 5px;
+                padding: 5px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
 
         button_style = f"""
             QPushButton {{
@@ -1516,120 +1542,7 @@ class GoldAnalysisDialog(QDialog):
             }}
         """)
 
-        # Tab 1: 设置
-        settings_tab = QWidget()
-        settings_layout = QVBoxLayout(settings_tab)
-        settings_layout.setContentsMargins(10, 10, 10, 10)
-        settings_layout.setSpacing(8)
-
-        settings_group = QWidget()
-        settings_group.setStyleSheet(f"{ff}")
-        sl = QVBoxLayout(settings_group)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(4)
-
-        url_row = QHBoxLayout()
-        url_lbl = QLabel('API URL')
-        url_lbl.setFixedWidth(52)
-        url_lbl.setStyleSheet(setting_label_style)
-        self._url_input = QLineEdit()
-        self._url_input.setStyleSheet(input_style)
-        self._url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
-        url_row.addWidget(url_lbl)
-        url_row.addWidget(self._url_input)
-        sl.addLayout(url_row)
-
-        key_row = QHBoxLayout()
-        key_lbl = QLabel('API Key')
-        key_lbl.setFixedWidth(52)
-        key_lbl.setStyleSheet(setting_label_style)
-        self._key_input = QLineEdit()
-        self._key_input.setStyleSheet(input_style)
-        self._key_input.setEchoMode(QLineEdit.Password)
-        self._key_input.setPlaceholderText('sk-...')
-        key_row.addWidget(key_lbl)
-        key_row.addWidget(self._key_input)
-        sl.addLayout(key_row)
-
-        td_key_row = QHBoxLayout()
-        td_key_lbl = QLabel('TD Key')
-        td_key_lbl.setFixedWidth(52)
-        td_key_lbl.setStyleSheet(setting_label_style)
-        self._td_key_input = QLineEdit()
-        self._td_key_input.setStyleSheet(input_style)
-        self._td_key_input.setEchoMode(QLineEdit.Password)
-        self._td_key_input.setPlaceholderText('Twelve Data API Key')
-        td_key_row.addWidget(td_key_lbl)
-        td_key_row.addWidget(self._td_key_input)
-        sl.addLayout(td_key_row)
-
-        model_row = QHBoxLayout()
-        model_lbl = QLabel('Model')
-        model_lbl.setFixedWidth(52)
-        model_lbl.setStyleSheet(setting_label_style)
-        self._model_input = QLineEdit()
-        self._model_input.setStyleSheet(input_style)
-        self._model_input.setPlaceholderText('minimax-m2.7')
-        model_row.addWidget(model_lbl)
-        model_row.addWidget(self._model_input)
-        sl.addLayout(model_row)
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(6)
-        mode_lbl = QLabel('周期')
-        mode_lbl.setFixedWidth(52)
-        mode_lbl.setStyleSheet(setting_label_style)
-        self._analysis_mode_combo = QComboBox()
-        self._analysis_mode_combo.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {t['surface']};
-                color: {t['text']};
-                border: 1px solid {t['border']};
-                border-radius: 5px;
-                padding: 4px 8px;
-                font-size: 8pt; {ff}
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 18px;
-            }}
-        """)
-        for mode_key in ('24h_hourly', '30d_daily'):
-            mode_config = GOLD_ANALYSIS_MODES[mode_key]
-            self._analysis_mode_combo.addItem(mode_config['ui_label'], mode_key)
-        mode_row.addWidget(mode_lbl)
-        mode_row.addWidget(self._analysis_mode_combo, 1)
-        sl.addLayout(mode_row)
-
-        settings_layout.addWidget(settings_group)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-
-        self._settings_save_btn = QPushButton('💾 Save')
-        self._settings_save_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._settings_save_btn.setFixedWidth(80)
-        self._settings_save_btn.setStyleSheet(button_style)
-        self._settings_save_btn.clicked.connect(self._save_current_settings)
-        btn_row.addWidget(self._settings_save_btn)
-
-        self._test_btn = QPushButton('🔗 测试连通')
-        self._test_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._test_btn.setFixedWidth(100)
-        self._test_btn.setStyleSheet(button_style)
-        self._test_btn.clicked.connect(self._test_connection)
-        btn_row.addWidget(self._test_btn)
-
-        self._test_result_label = QLabel('')
-        self._test_result_label.setStyleSheet(f"font-size: 7.5pt; {ff}")
-        btn_row.addWidget(self._test_result_label)
-        btn_row.addStretch()
-        settings_layout.addLayout(btn_row)
-        settings_layout.addStretch()
-
-        self._tabs.addTab(settings_tab, '⚙️ 设置')
-
-        # Tab 2: 对话结果
+        # Tab 1: 分析对话
         result_tab = QWidget()
         result_layout = QVBoxLayout(result_tab)
         result_layout.setContentsMargins(10, 10, 10, 10)
@@ -1726,84 +1639,235 @@ class GoldAnalysisDialog(QDialog):
         self._result_splitter.setSizes([420, 120])
         result_layout.addWidget(self._result_splitter, 1)
 
-        self._tabs.addTab(result_tab, '💬 分析对话')
+        self._tabs.addTab(result_tab, '💬 分析')
         self._render_chat_history()
 
-        # Tab 2: 原始数据
+        # Tab 2: analyst 原始分析
+        self._analyst_tab = QWidget()
+        analyst_layout = QVBoxLayout(self._analyst_tab)
+        analyst_layout.setContentsMargins(10, 10, 10, 10)
+        analyst_layout.setSpacing(8)
+
+        self._analyst_summary_label = QLabel('暂无 analyst 原始分析')
+        analyst_layout.addWidget(self._analyst_summary_label)
+
+        self._analyst_scroll = QScrollArea()
+        self._analyst_scroll.setWidgetResizable(True)
+        self._analyst_reports_container = QWidget()
+        self._analyst_reports_layout = QVBoxLayout(self._analyst_reports_container)
+        self._analyst_reports_layout.setContentsMargins(0, 0, 0, 0)
+        self._analyst_reports_layout.setSpacing(8)
+        self._analyst_reports_layout.addStretch()
+        self._analyst_scroll.setWidget(self._analyst_reports_container)
+        analyst_layout.addWidget(self._analyst_scroll, 1)
+
+        self._tabs.addTab(self._analyst_tab, '🧠 Analyst')
+        self._render_analyst_tab()
+
+        # Tab 3: 原始数据
+        self._raw_tab = QWidget()
+        raw_layout = QVBoxLayout(self._raw_tab)
+        raw_layout.setContentsMargins(10, 10, 10, 10)
+        raw_layout.setSpacing(8)
+
+        self._raw_meta_card = QWidget()
+        raw_meta_layout = QVBoxLayout(self._raw_meta_card)
+        raw_meta_layout.setContentsMargins(12, 10, 12, 10)
+        raw_meta_layout.setSpacing(8)
+
+        raw_meta_header = QHBoxLayout()
+        raw_meta_header.setSpacing(8)
+        raw_meta_title_box = QVBoxLayout()
+        raw_meta_title_box.setContentsMargins(0, 0, 0, 0)
+        raw_meta_title_box.setSpacing(2)
+        self._raw_meta_title_label = QLabel('数据概览')
+        self._raw_meta_hint_label = QLabel('周期、来源与现价单独展示，CSV 表格保持独立查看')
+        raw_meta_title_box.addWidget(self._raw_meta_title_label)
+        raw_meta_title_box.addWidget(self._raw_meta_hint_label)
+        raw_meta_header.addLayout(raw_meta_title_box)
+        raw_meta_header.addStretch()
+
+        self._copy_raw_csv_btn = QPushButton('复制 CSV')
+        self._copy_raw_csv_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._copy_raw_csv_btn.setFixedWidth(88)
+        self._copy_raw_csv_btn.setEnabled(False)
+        self._copy_raw_csv_btn.clicked.connect(self._copy_raw_csv)
+        raw_meta_header.addWidget(self._copy_raw_csv_btn)
+        raw_meta_layout.addLayout(raw_meta_header)
+
+        raw_meta_grid = QGridLayout()
+        raw_meta_grid.setHorizontalSpacing(10)
+        raw_meta_grid.setVerticalSpacing(6)
+        self._raw_meta_period_label = QLabel('分析周期：-')
+        self._raw_meta_source_label = QLabel('K线来源：-')
+        self._raw_meta_price_label = QLabel('伦敦金现货价：-')
+        raw_meta_grid.addWidget(self._raw_meta_period_label, 0, 0)
+        raw_meta_grid.addWidget(self._raw_meta_source_label, 0, 1)
+        raw_meta_grid.addWidget(self._raw_meta_price_label, 1, 0, 1, 2)
+        raw_meta_grid.setColumnStretch(0, 1)
+        raw_meta_grid.setColumnStretch(1, 1)
+        raw_meta_layout.addLayout(raw_meta_grid)
+        raw_layout.addWidget(self._raw_meta_card)
+
         self._raw_browser = QTextBrowser()
         self._raw_browser.setOpenExternalLinks(False)
-        self._raw_browser.setStyleSheet(f"""
-            QTextBrowser {{
-                background-color: {t['panel_alt']};
-                color: {t['text']};
-                border: none;
-                padding: 6px;
-                font-size: 7.5pt; {ff}
-            }}
-        """)
-        self._raw_browser.setHtml(
-            '<p style="color:' + t['text_muted'] + '; text-align:center; margin-top:40px;">'
-            '暂无数据，请先点击「开始分析」</p>'
-        )
-        self._tabs.addTab(self._raw_browser, '📋 原始数据')
+        raw_layout.addWidget(self._raw_browser, 1)
+        self._raw_csv_text = ''
+        self._set_raw_meta({})
+        self._render_raw_content()
+        self._raw_meta_card.setVisible(False)
+        self._tabs.addTab(self._raw_tab, '📋 原始数据')
 
-        # Tab 3: 提示词
-        prompt_tab = QWidget()
-        prompt_layout = QVBoxLayout(prompt_tab)
-        prompt_layout.setContentsMargins(10, 10, 10, 10)
-        prompt_layout.setSpacing(8)
+        # Tab 4: 设置
+        self._settings_tab = QWidget()
+        self._settings_tab.setObjectName('goldSettingsTab')
+        settings_tab_layout = QVBoxLayout(self._settings_tab)
+        settings_tab_layout.setContentsMargins(0, 0, 0, 0)
+        settings_tab_layout.setSpacing(0)
 
-        prompt_label_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
-        prompt_input_style = f"""
-            QPlainTextEdit {{
-                background-color: {t['panel_alt']};
-                color: {t['text']};
-                border: 1px solid {t['border']};
-                border-radius: 5px;
-                padding: 6px;
-                font-size: 8pt; {ff}
-            }}
-            QPlainTextEdit:focus {{
-                border: 1px solid {t['accent']};
-            }}
-        """
+        self._settings_scroll = QScrollArea()
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        prompt_label = QLabel('提示词模板（可直接覆盖修改）')
-        prompt_label.setStyleSheet(prompt_label_style)
-        prompt_layout.addWidget(prompt_label)
+        self._settings_content = QWidget()
+        self._settings_content.setObjectName('goldSettingsContent')
+        settings_layout = QVBoxLayout(self._settings_content)
+        settings_layout.setContentsMargins(10, 10, 10, 10)
+        settings_layout.setSpacing(10)
 
-        variable_button_style = f"""
-            QPushButton {{
-                background-color: {t['surface']}; color: {t['text']};
-                border: 1px solid {t['border']}; border-radius: 5px; padding: 4px 8px;
-                font-size: 7.8pt; {ff}
-            }}
-            QPushButton:hover {{
-                background-color: {t['surface_hover']};
-            }}
-        """
+        config_content = QWidget()
+        config_content_layout = QVBoxLayout(config_content)
+        config_content_layout.setContentsMargins(0, 0, 0, 0)
+        config_content_layout.setSpacing(10)
 
-        prompt_toolbar = QHBoxLayout()
-        prompt_toolbar.setSpacing(8)
-        variable_label = QLabel('变量一键插入')
-        variable_label.setStyleSheet(prompt_label_style)
-        prompt_toolbar.addWidget(variable_label)
-        prompt_toolbar.addStretch()
+        config_hint = QLabel('配置 TD Key、分析周期，以及 summarizer 的 API 连接信息')
+        config_content_layout.addWidget(config_hint)
 
-        self._prompt_save_btn = QPushButton('💾 Save')
-        self._prompt_save_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._prompt_save_btn.setFixedWidth(80)
-        self._prompt_save_btn.setStyleSheet(button_style)
-        self._prompt_save_btn.clicked.connect(self._save_current_settings)
-        prompt_toolbar.addWidget(self._prompt_save_btn)
+        shared_grid = QGridLayout()
+        shared_grid.setHorizontalSpacing(10)
+        shared_grid.setVerticalSpacing(8)
+
+        td_key_lbl = QLabel('TD Key')
+        td_key_lbl.setStyleSheet(setting_label_style)
+        self._td_key_input = QLineEdit()
+        self._td_key_input.setEchoMode(QLineEdit.Password)
+        self._td_key_input.setPlaceholderText('Twelve Data API Key')
+        shared_grid.addWidget(td_key_lbl, 0, 0)
+        shared_grid.addWidget(self._td_key_input, 0, 1)
+
+        mode_lbl = QLabel('周期')
+        mode_lbl.setStyleSheet(setting_label_style)
+        self._analysis_mode_combo = QComboBox()
+        for mode_key in ('24h_hourly', '30d_daily'):
+            mode_config = GOLD_ANALYSIS_MODES[mode_key]
+            self._analysis_mode_combo.addItem(mode_config['ui_label'], mode_key)
+        shared_grid.addWidget(mode_lbl, 0, 2)
+        shared_grid.addWidget(self._analysis_mode_combo, 0, 3)
+        shared_grid.setColumnStretch(1, 1)
+        shared_grid.setColumnStretch(3, 1)
+        config_content_layout.addLayout(shared_grid)
+
+        summarizer_api_title = QLabel('Summarizer API')
+        summarizer_api_title.setStyleSheet(setting_label_style)
+        config_content_layout.addWidget(summarizer_api_title)
+
+        summarizer_grid = QGridLayout()
+        summarizer_grid.setHorizontalSpacing(10)
+        summarizer_grid.setVerticalSpacing(8)
+
+        summarizer_url_lbl = QLabel('API URL')
+        summarizer_url_lbl.setStyleSheet(setting_label_style)
+        self._summarizer_url_input = QLineEdit()
+        self._summarizer_url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
+        summarizer_grid.addWidget(summarizer_url_lbl, 0, 0)
+        summarizer_grid.addWidget(self._summarizer_url_input, 0, 1, 1, 3)
+
+        summarizer_key_lbl = QLabel('API Key')
+        summarizer_key_lbl.setStyleSheet(setting_label_style)
+        self._summarizer_key_input = QLineEdit()
+        self._summarizer_key_input.setEchoMode(QLineEdit.Password)
+        self._summarizer_key_input.setPlaceholderText('sk-...')
+        summarizer_grid.addWidget(summarizer_key_lbl, 1, 0)
+        summarizer_grid.addWidget(self._summarizer_key_input, 1, 1)
+
+        summarizer_model_lbl = QLabel('Model')
+        summarizer_model_lbl.setStyleSheet(setting_label_style)
+        self._summarizer_model_input = QLineEdit()
+        self._summarizer_model_input.setPlaceholderText('claude-sonnet-4-6')
+        summarizer_grid.addWidget(summarizer_model_lbl, 1, 2)
+        summarizer_grid.addWidget(self._summarizer_model_input, 1, 3)
+        summarizer_grid.setColumnStretch(1, 1)
+        summarizer_grid.setColumnStretch(3, 1)
+        config_content_layout.addLayout(summarizer_grid)
+
+        summarizer_actions = QHBoxLayout()
+        summarizer_actions.setSpacing(6)
+        self._test_result_label = QLabel('')
+        summarizer_actions.addWidget(self._test_result_label, 1)
+
+        self._test_summarizer_btn = QPushButton('测试 summarizer')
+        self._test_summarizer_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._test_summarizer_btn.setFixedWidth(120)
+        self._test_summarizer_btn.clicked.connect(lambda: self._test_connection('summarizer'))
+        summarizer_actions.addWidget(self._test_summarizer_btn)
+        config_content_layout.addLayout(summarizer_actions)
+
+        analysts_content = QWidget()
+        analysts_content_layout = QVBoxLayout(analysts_content)
+        analysts_content_layout.setContentsMargins(0, 0, 0, 0)
+        analysts_content_layout.setSpacing(8)
+
+        analysts_hint = QLabel('支持多个 analyst，按列表顺序依次分析，可单独启用、删除、测试，或从模板快速新增')
+        analysts_content_layout.addWidget(analysts_hint)
+
+        analysts_header = QHBoxLayout()
+        analysts_header.addStretch()
+
+        self._use_analyst_template_btn = QPushButton('套用模板')
+        self._use_analyst_template_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._use_analyst_template_btn.setFixedWidth(92)
+        self._use_analyst_template_btn.clicked.connect(self._add_analyst_from_template)
+        analysts_header.addWidget(self._use_analyst_template_btn)
+
+        self._add_analyst_btn = QPushButton('新增 analyst')
+        self._add_analyst_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._add_analyst_btn.setFixedWidth(100)
+        self._add_analyst_btn.clicked.connect(self._add_analyst_card)
+        analysts_header.addWidget(self._add_analyst_btn)
+        analysts_content_layout.addLayout(analysts_header)
+
+        self._analysts_container = QWidget()
+        self._analysts_layout = QVBoxLayout(self._analysts_container)
+        self._analysts_layout.setContentsMargins(0, 0, 0, 0)
+        self._analysts_layout.setSpacing(8)
+        analysts_content_layout.addWidget(self._analysts_container)
+
+        prompts_content = QWidget()
+        prompts_content_layout = QVBoxLayout(prompts_content)
+        prompts_content_layout.setContentsMargins(0, 0, 0, 0)
+        prompts_content_layout.setSpacing(10)
+
+        prompts_hint = QLabel('分别维护 analyst 共用提示词与 summarizer 汇总提示词')
+        prompts_content_layout.addWidget(prompts_hint)
+
+        shared_prompt_header = QHBoxLayout()
+        shared_prompt_header.setSpacing(8)
+        shared_prompt_title_box = QVBoxLayout()
+        shared_prompt_title_box.setContentsMargins(0, 0, 0, 0)
+        shared_prompt_title_box.setSpacing(2)
+        shared_prompt_title = QLabel('共享 analyst 提示词')
+        shared_prompt_hint = QLabel('所有 analyst 共用同一份分析提示词模板')
+        shared_prompt_title_box.addWidget(shared_prompt_title)
+        shared_prompt_title_box.addWidget(shared_prompt_hint)
+        shared_prompt_header.addLayout(shared_prompt_title_box)
+        shared_prompt_header.addStretch()
 
         self._restore_prompt_btn = QPushButton('恢复默认')
         self._restore_prompt_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self._restore_prompt_btn.setFixedWidth(88)
-        self._restore_prompt_btn.setStyleSheet(button_style)
         self._restore_prompt_btn.clicked.connect(self._restore_default_prompt)
-        prompt_toolbar.addWidget(self._restore_prompt_btn)
-        prompt_layout.addLayout(prompt_toolbar)
+        shared_prompt_header.addWidget(self._restore_prompt_btn)
+        prompts_content_layout.addLayout(shared_prompt_header)
 
         variable_grid = QGridLayout()
         variable_grid.setHorizontalSpacing(6)
@@ -1820,86 +1884,736 @@ class GoldAnalysisDialog(QDialog):
             btn = QPushButton(label)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
             btn.setMinimumWidth(88)
-            btn.setStyleSheet(variable_button_style)
-            btn.clicked.connect(lambda _, value=token: self._insert_prompt_variable(value))
+            btn.clicked.connect(lambda _, value=token: self._insert_prompt_variable(value, self._shared_prompt_input))
             variable_grid.addWidget(btn, index // 3, index % 3)
             self._prompt_variable_buttons.append(btn)
         variable_grid.setColumnStretch(0, 1)
         variable_grid.setColumnStretch(1, 1)
         variable_grid.setColumnStretch(2, 1)
-        prompt_layout.addLayout(variable_grid)
+        prompts_content_layout.addLayout(variable_grid)
 
-        self._prompt_input = QPlainTextEdit()
-        self._prompt_input.setPlaceholderText('可直接修改完整提示词模板')
-        self._prompt_input.setStyleSheet(prompt_input_style)
-        prompt_layout.addWidget(self._prompt_input, 1)
+        self._shared_prompt_input = QPlainTextEdit()
+        self._shared_prompt_input.setPlaceholderText('可直接修改 analyst 共用提示词模板')
+        self._shared_prompt_input.setMinimumHeight(220)
+        prompts_content_layout.addWidget(self._shared_prompt_input)
 
-        self._tabs.addTab(prompt_tab, '📝 提示词')
+        summarizer_prompt_header = QHBoxLayout()
+        summarizer_prompt_title_box = QVBoxLayout()
+        summarizer_prompt_title_box.setContentsMargins(0, 0, 0, 0)
+        summarizer_prompt_title_box.setSpacing(2)
+        summarizer_prompt_title = QLabel('汇总提示词')
+        summarizer_prompt_hint = QLabel('summarizer 使用单独提示词，支持恢复默认')
+        summarizer_prompt_title_box.addWidget(summarizer_prompt_title)
+        summarizer_prompt_title_box.addWidget(summarizer_prompt_hint)
+        summarizer_prompt_header.addLayout(summarizer_prompt_title_box)
+        summarizer_prompt_header.addStretch()
+
+        self._restore_summarizer_prompt_btn = QPushButton('恢复默认')
+        self._restore_summarizer_prompt_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._restore_summarizer_prompt_btn.setFixedWidth(88)
+        self._restore_summarizer_prompt_btn.clicked.connect(self._restore_default_summarizer_prompt)
+        summarizer_prompt_header.addWidget(self._restore_summarizer_prompt_btn)
+        prompts_content_layout.addLayout(summarizer_prompt_header)
+
+        self._summarizer_prompt_input = QPlainTextEdit()
+        self._summarizer_prompt_input.setPlaceholderText('可直接修改 summarizer 汇总提示词模板')
+        self._summarizer_prompt_input.setMinimumHeight(220)
+        prompts_content_layout.addWidget(self._summarizer_prompt_input)
+
+        config_section = self._create_settings_section('config', '⚙️ 配置', config_content, expanded=True)
+        analysts_section = self._create_settings_section('analysts', '🧠 分析师', analysts_content, expanded=True)
+        prompts_section = self._create_settings_section('prompts', '📝 提示词', prompts_content, expanded=False)
+        settings_layout.addWidget(config_section['widget'])
+        settings_layout.addWidget(analysts_section['widget'])
+        settings_layout.addWidget(prompts_section['widget'], 1)
+
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(6)
+        footer_row.addStretch()
+        self._save_btn = QPushButton('💾 保存设置')
+        self._save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._save_btn.setFixedWidth(110)
+        self._save_btn.clicked.connect(self._save_current_settings)
+        footer_row.addWidget(self._save_btn)
+        settings_layout.addLayout(footer_row)
+
+        settings_layout.addStretch()
+        self._settings_scroll.setWidget(self._settings_content)
+        settings_tab_layout.addWidget(self._settings_scroll)
+
+        self._tabs.addTab(self._settings_tab, '⚙️ 设置')
 
         self._analysis_mode_combo.currentIndexChanged.connect(self._refresh_analysis_meta)
-        self._model_input.textChanged.connect(self._refresh_analysis_meta)
+        self._summarizer_model_input.textChanged.connect(self._refresh_analysis_meta)
         self._refresh_analysis_meta()
 
         cl.addWidget(self._tabs, 1)
         main_layout.addWidget(container)
+        self._apply_theme_styles()
 
     def load_settings(self, ai_config, gold_data_config=None):
         """从 config 加载 AI 设置"""
         gold_data_config = gold_data_config or {}
-        self._url_input.setText(ai_config.get('api_url', ''))
-        self._key_input.setText(ai_config.get('api_key', ''))
+        normalized = normalize_ai_settings(ai_config)
         self._td_key_input.setText(gold_data_config.get('twelvedata_api_key', ''))
-        self._model_input.setText(ai_config.get('model', ''))
         mode_key = gold_data_config.get('analysis_mode', '24h_hourly')
         mode_index = self._analysis_mode_combo.findData(mode_key)
         if mode_index >= 0:
             self._analysis_mode_combo.setCurrentIndex(mode_index)
-        self._prompt_input.setPlainText(
-            normalize_prompt_template(ai_config.get('prompt_template') or ai_config.get('custom_prompt', ''))
-        )
+        self._shared_prompt_input.setPlainText(normalized.get('shared_prompt_template', ''))
+        self._summarizer_prompt_input.setPlainText(normalized.get('summarizer_prompt_template', ''))
+        summarizer = normalized.get('summarizer', {})
+        self._summarizer_url_input.setText(summarizer.get('api_url', ''))
+        self._summarizer_key_input.setText(summarizer.get('api_key', ''))
+        self._summarizer_model_input.setText(summarizer.get('model', ''))
+        self._rebuild_analyst_cards(normalized.get('analysts', []))
         self._test_result_label.setText('')
         self._set_header_status('')
         self._refresh_analysis_meta()
 
     def save_settings(self):
-        """返回当前 AI 设置（含提示词模板）"""
+        """返回当前 AI 设置（含 ensemble 配置）"""
+        analysts = []
+        for card in self._analyst_card_state:
+            analysts.append({
+                'name': card['name_input'].text().strip(),
+                'api_url': card['url_input'].text().strip(),
+                'api_key': card['key_input'].text().strip(),
+                'model': card['model_input'].text().strip(),
+                'enabled': card['enabled_checkbox'].isChecked(),
+            })
         return {
-            'ai_settings': {
-                'api_url': self._url_input.text().strip(),
-                'api_key': self._key_input.text().strip(),
-                'model': self._model_input.text().strip(),
-                'prompt_template': self._prompt_input.toPlainText().strip(),
-            },
+            'ai_settings': normalize_ai_settings({
+                'shared_prompt_template': self._shared_prompt_input.toPlainText().strip(),
+                'summarizer_prompt_template': self._summarizer_prompt_input.toPlainText().strip(),
+                'analysts': analysts,
+                'summarizer': {
+                    'api_url': self._summarizer_url_input.text().strip(),
+                    'api_key': self._summarizer_key_input.text().strip(),
+                    'model': self._summarizer_model_input.text().strip(),
+                },
+            }),
             'gold_data_settings': {
                 'twelvedata_api_key': self._td_key_input.text().strip(),
                 'analysis_mode': self._analysis_mode_combo.currentData() or '24h_hourly',
             },
         }
 
-    def _set_header_status(self, text, color=None):
+    def _set_header_status(self, text, color=None, auto_clear_ms=0):
+        self._header_status_timer.stop()
         color = color or self.theme_tokens['text_muted']
         if text:
             self._header_status_label.setText(f'<span style="color:{color};">{text}</span>')
+            if auto_clear_ms > 0:
+                self._header_status_timer.start(auto_clear_ms)
         else:
             self._header_status_label.setText('')
+
+    def apply_theme(self, dark_mode):
+        if self.dark_mode == dark_mode:
+            return
+        current_tab_index = self._tabs.currentIndex()
+        result_scroll = self._result_browser.verticalScrollBar().value()
+        analyst_scroll = self._analyst_scroll.verticalScrollBar().value()
+        raw_scroll = self._raw_browser.verticalScrollBar().value()
+        splitter_sizes = self._result_splitter.sizes()
+        self.dark_mode = dark_mode
+        self.theme_tokens = get_theme_tokens(dark_mode)
+        self._apply_theme_styles()
+        self._render_chat_history(preserve_scroll=True)
+        self._render_analyst_tab()
+        self._render_raw_content()
+        self._refresh_analysis_meta()
+        self._tabs.setCurrentIndex(current_tab_index)
+        self._result_splitter.setSizes(splitter_sizes)
+        self._result_browser.verticalScrollBar().setValue(result_scroll)
+        self._analyst_scroll.verticalScrollBar().setValue(analyst_scroll)
+        self._raw_browser.verticalScrollBar().setValue(raw_scroll)
+
+    def _apply_theme_styles(self):
+        t = self.theme_tokens
+        ff = f"font-family: '{UI_FONT_FAMILY}', '{UI_FONT_FALLBACK}', sans-serif;"
+        input_style = f"""
+            QLineEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 5px;
+                padding: 5px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+        button_style = f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+            QPushButton:disabled {{
+                color: {t['text_muted']};
+            }}
+        """
+        primary_button_style = f"""
+            QPushButton {{
+                background-color: {t['accent']}; color: #ffffff;
+                border: none; border-radius: 5px; padding: 6px;
+                font-size: 9pt; font-weight: 600; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['accent_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {t['accent_pressed']};
+            }}
+            QPushButton:disabled {{
+                background-color: {t['surface']}; color: {t['text_muted']};
+            }}
+        """
+        prompt_input_style = f"""
+            QPlainTextEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                padding: 6px;
+                font-size: 8pt; {ff}
+            }}
+            QPlainTextEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+        browser_style = f"""
+            QTextBrowser {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: none;
+                padding: 6px;
+                font-size: 8.2pt; {ff}
+            }}
+        """
+        card_style = f"""
+            QWidget#settingsSectionCard {{
+                background-color: {t['panel_hover']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 8px;
+            }}
+        """
+        section_button_style = f"""
+            QPushButton {{
+                text-align: left;
+                background-color: {t['surface']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 8.6pt;
+                font-weight: 600;
+                {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """
+        combo_style = f"""
+            QComboBox {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 18px;
+            }}
+        """
+        variable_button_style = f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text_strong']};
+                border: 1px solid {t['border_soft']}; border-radius: 5px; padding: 4px 8px;
+                font-size: 7.8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """
+        check_box_style = f"QCheckBox {{ color: {t['text']}; font-size: 8pt; {ff} }}"
+        label_style = f"color: {t['text']}; font-size: 7.8pt; font-weight: 600; {ff}"
+        hint_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        title_style = f"color: {t['text_strong']}; font-size: 8.5pt; font-weight: 600; {ff}"
+
+        self._container.setStyleSheet(f"""
+            QWidget#goldAnalysisContainer {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 8px;
+                {ff}
+            }}
+        """)
+        self._tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {t['border']};
+                border-radius: 5px;
+                background-color: {t['panel_alt']};
+            }}
+            QTabBar::tab {{
+                background-color: {t['surface']}; color: {t['text']};
+                padding: 4px 12px; font-size: 8pt; {ff}
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                font-weight: 600;
+            }}
+        """)
+        self._header_status_label.setStyleSheet(hint_style)
+        self._analysis_meta_label.setStyleSheet(hint_style)
+        self._analyze_btn.setStyleSheet(primary_button_style)
+        self._send_btn.setStyleSheet(primary_button_style.replace('font-size: 9pt;', 'font-size: 8.5pt;'))
+        self._followup_input.setStyleSheet(prompt_input_style)
+        self._result_browser.setStyleSheet(browser_style.replace('font-size: 8.2pt;', 'font-size: 8.5pt;'))
+        self._result_splitter.setStyleSheet(f"""
+            QSplitter::handle:vertical {{
+                background-color: {t['surface']};
+                border-top: 1px solid {t['border']};
+                border-bottom: 1px solid {t['border']};
+                margin: 2px 0;
+            }}
+            QSplitter::handle:vertical:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """)
+
+        self._analyst_tab.setStyleSheet(f"background-color: {t['panel_alt']};")
+        self._analyst_summary_label.setStyleSheet(hint_style)
+        self._analyst_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: {t['panel_alt']};
+            }}
+            QScrollArea > QWidget {{
+                background-color: {t['panel_alt']};
+            }}
+        """)
+        self._analyst_scroll.viewport().setStyleSheet(f"background-color: {t['panel_alt']};")
+        self._analyst_reports_container.setStyleSheet(f"background-color: {t['panel_alt']};")
+
+        self._raw_tab.setStyleSheet(f"background-color: {t['panel_alt']};")
+        self._raw_meta_card.setObjectName('rawMetaCard')
+        self._raw_meta_card.setStyleSheet(f"""
+            QWidget#rawMetaCard {{
+                background-color: {t['panel_hover']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 8px;
+            }}
+        """)
+        self._raw_meta_title_label.setStyleSheet(title_style)
+        self._raw_meta_hint_label.setStyleSheet(hint_style)
+        self._raw_meta_period_label.setStyleSheet(label_style)
+        self._raw_meta_source_label.setStyleSheet(label_style)
+        self._raw_meta_price_label.setStyleSheet(label_style)
+        self._copy_raw_csv_btn.setStyleSheet(button_style)
+        self._raw_browser.setStyleSheet(browser_style.replace('font-size: 8.2pt;', 'font-size: 7.5pt;'))
+
+        self._settings_tab.setStyleSheet(f"background-color: {t['panel_alt']};")
+        self._settings_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: {t['panel_alt']};
+            }}
+            QScrollArea > QWidget {{
+                background-color: {t['panel_alt']};
+            }}
+        """)
+        self._settings_scroll.viewport().setStyleSheet(f"background-color: {t['panel_alt']};")
+        self._settings_content.setStyleSheet(f"QWidget#goldSettingsContent {{ background-color: {t['panel_alt']}; }}")
+        self._td_key_input.setStyleSheet(input_style)
+        self._analysis_mode_combo.setStyleSheet(combo_style)
+        self._summarizer_url_input.setStyleSheet(input_style)
+        self._summarizer_key_input.setStyleSheet(input_style)
+        self._summarizer_model_input.setStyleSheet(input_style)
+        self._test_result_label.setStyleSheet(f"color: {t['text']}; font-size: 7.5pt; {ff}")
+        self._test_summarizer_btn.setStyleSheet(button_style)
+        self._use_analyst_template_btn.setStyleSheet(button_style)
+        self._add_analyst_btn.setStyleSheet(button_style)
+        self._restore_prompt_btn.setStyleSheet(button_style)
+        self._restore_summarizer_prompt_btn.setStyleSheet(button_style)
+        self._shared_prompt_input.setStyleSheet(prompt_input_style)
+        self._summarizer_prompt_input.setStyleSheet(prompt_input_style)
+        self._save_btn.setStyleSheet(primary_button_style)
+        for btn in self._prompt_variable_buttons:
+            btn.setStyleSheet(variable_button_style)
+        for label in self._settings_content.findChildren(QLabel):
+            if label in {
+                self._header_status_label, self._analysis_meta_label, self._analyst_summary_label,
+                self._raw_meta_title_label, self._raw_meta_hint_label, self._raw_meta_period_label,
+                self._raw_meta_source_label, self._raw_meta_price_label, self._test_result_label,
+            }:
+                continue
+            if label.text() in {'共享 analyst 提示词', '汇总提示词', 'Summarizer API'} or label.text().startswith(('⚙️', '🧠', '📝')):
+                label.setStyleSheet(title_style)
+            elif '配置' in label.text() or '提示词' in label.text() or 'analyst' in label.text() or 'summarizer' in label.text() or '周期、来源与现价' in label.text():
+                label.setStyleSheet(hint_style)
+        for section in self._settings_sections.values():
+            section['widget'].setStyleSheet(card_style)
+            section['button'].setStyleSheet(section_button_style)
+            section['content'].setStyleSheet(f"background-color: {t['panel_hover']};")
+            section['button'].setText(f"{'▼' if section['button'].isChecked() else '▶'} {section['title']}")
+        for card in self._analyst_card_state:
+            self._style_config_analyst_card(card)
+
+    def _create_settings_section(self, key, title, content_widget, expanded=False):
+        wrapper = QWidget()
+        wrapper.setObjectName('settingsSectionCard')
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+
+        header_btn = QPushButton()
+        header_btn.setCheckable(True)
+        expanded = self._settings_section_state.get(key, expanded)
+        header_btn.setChecked(expanded)
+        header_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        layout.addWidget(header_btn)
+        layout.addWidget(content_widget)
+        content_widget.setVisible(expanded)
+
+        section = {
+            'widget': wrapper,
+            'button': header_btn,
+            'content': content_widget,
+            'title': title,
+            'key': key,
+        }
+        self._settings_sections[key] = section
+        header_btn.toggled.connect(lambda checked, name=key: self._toggle_settings_section(name, checked))
+        header_btn.setText(f"{'▼' if expanded else '▶'} {title}")
+        return section
+
+    def _toggle_settings_section(self, key, checked):
+        section = self._settings_sections.get(key)
+        if not section:
+            return
+        self._settings_section_state[key] = checked
+        section['button'].setText(f"{'▼' if checked else '▶'} {section['title']}")
+        section['content'].setVisible(checked)
+
+    def _set_raw_meta(self, meta):
+        self._raw_meta = meta or {}
+        period_text = self._raw_meta.get('period_text') or '-'
+        source_text = self._raw_meta.get('kline_source') or '-'
+        spot_price = self._raw_meta.get('spot_price')
+        price_text = f"{spot_price} 美元/盎司" if isinstance(spot_price, (int, float)) and spot_price > 0 else '-'
+        self._raw_meta_period_label.setText(f'分析周期：{period_text}')
+        self._raw_meta_source_label.setText(f'K线来源：{source_text}')
+        self._raw_meta_price_label.setText(f'伦敦金现货价：{price_text}')
+        self._raw_meta_card.setVisible(bool(self._raw_meta))
+
+    def _render_raw_content(self):
+        if self._raw_html_content:
+            self._raw_browser.setHtml(self._raw_html_content)
+            return
+        self._raw_browser.setHtml(
+            '<p style="color:' + self.theme_tokens['text_muted'] + '; text-align:center; margin-top:40px;">'
+            '暂无数据，请先点击「开始分析」</p>'
+        )
+
+    def _style_config_analyst_card(self, card):
+        t = self.theme_tokens
+        ff = f"font-family: '{UI_FONT_FAMILY}', '{UI_FONT_FALLBACK}', sans-serif;"
+        input_style = f"""
+            QLineEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 5px;
+                padding: 5px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+        button_style = f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """
+        label_style = f"color: {t['text']}; font-size: 7.8pt; font-weight: 600; {ff}"
+        hint_style = f"color: {t['text_muted']}; font-size: 7.5pt; {ff}"
+        card['widget'].setStyleSheet(f"""
+            QWidget#settingsCard {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+            }}
+        """)
+        card['enabled_checkbox'].setStyleSheet(f"QCheckBox {{ color: {t['text']}; font-size: 8pt; {ff} }}")
+        card['name_input'].setStyleSheet(input_style)
+        card['url_input'].setStyleSheet(input_style)
+        card['key_input'].setStyleSheet(input_style)
+        card['model_input'].setStyleSheet(input_style)
+        card['test_btn'].setStyleSheet(button_style)
+        card['remove_btn'].setStyleSheet(button_style)
+        card['status_label'].setStyleSheet(hint_style)
+        for child in card['widget'].findChildren(QLabel):
+            child.setStyleSheet(label_style)
 
     def _refresh_analysis_meta(self):
         mode_key = self._analysis_mode_combo.currentData() or '24h_hourly'
         mode_config = get_gold_analysis_mode_config(mode_key)
-        model = self._model_input.text().strip() or '未设置'
+        enabled_count = sum(
+            1 for card in self._analyst_card_state
+            if card['enabled_checkbox'].isChecked()
+        )
+        summarizer_model = self._summarizer_model_input.text().strip() or '未设置'
         self._analysis_meta_label.setText(
-            f"当前分析周期：{mode_config['ui_label']}｜模型：{model}"
+            f"当前分析周期：{mode_config['ui_label']}｜已启用 analyst：{enabled_count}｜Summarizer：{summarizer_model}"
         )
 
-    def _insert_prompt_variable(self, token):
-        cursor = self._prompt_input.textCursor()
+    def _insert_prompt_variable(self, token, editor=None):
+        target = editor or self._shared_prompt_input
+        cursor = target.textCursor()
         cursor.insertText(token)
-        self._prompt_input.setTextCursor(cursor)
-        self._prompt_input.setFocus()
+        target.setTextCursor(cursor)
+        target.setFocus()
 
     def _restore_default_prompt(self):
-        self._prompt_input.setPlainText(get_default_analysis_prompt())
-        self._set_header_status('已恢复默认提示词', '#5a6a7a')
+        self._shared_prompt_input.setPlainText(get_default_analysis_prompt())
+        self._set_header_status('已恢复默认 analyst 提示词', '#5a6a7a', auto_clear_ms=3000)
+
+    def _restore_default_summarizer_prompt(self):
+        self._summarizer_prompt_input.setPlainText(get_default_summarizer_prompt())
+        self._set_header_status('已恢复默认汇总提示词', '#5a6a7a', auto_clear_ms=3000)
+
+    def _rebuild_analyst_cards(self, analysts):
+        while self._analysts_layout.count():
+            item = self._analysts_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._analyst_card_state = []
+        for analyst in analysts or []:
+            self._create_analyst_card(analyst)
+        if not self._analyst_card_state:
+            self._create_analyst_card({})
+        self._refresh_analysis_meta()
+
+    def _add_analyst_card(self):
+        next_index = len(self._analyst_card_state) + 1
+        self._create_analyst_card({'name': f'Analyst {next_index}', 'enabled': True})
+        self._refresh_analysis_meta()
+
+    def _add_analyst_from_template(self):
+        templates = []
+        seen = set()
+        for index, card in enumerate(self._analyst_card_state, start=1):
+            template = {
+                'name': card['name_input'].text().strip() or f'Analyst {index}',
+                'api_url': card['url_input'].text().strip(),
+                'api_key': card['key_input'].text().strip(),
+                'model': card['model_input'].text().strip(),
+                'enabled': card['enabled_checkbox'].isChecked(),
+            }
+            if not any([template['api_url'], template['api_key'], template['model']]):
+                continue
+            signature = (template['name'], template['api_url'], template['api_key'], template['model'])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            templates.append(template)
+        if not templates:
+            self._set_header_status('暂无可套用的 analyst 模版', '#e67e22', auto_clear_ms=3000)
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {self.theme_tokens['panel']};
+                color: {self.theme_tokens['text']};
+                border: 1px solid {self.theme_tokens['border']};
+            }}
+            QMenu::item:selected {{
+                background-color: {self.theme_tokens['surface_hover']};
+            }}
+        """)
+        recent_template = templates[-1]
+        recent_action = menu.addAction(f"复制最近一条：{recent_template['name']} / {recent_template['model'] or '未设置模型'}")
+        recent_action.setData({'template': recent_template, 'recent': True})
+        if len(templates) > 1:
+            menu.addSeparator()
+        for template in templates:
+            action = menu.addAction(f"{template['name']}｜{template['model'] or '未设置模型'}")
+            action.setData({'template': template, 'recent': False})
+
+        chosen = menu.exec_(self._use_analyst_template_btn.mapToGlobal(self._use_analyst_template_btn.rect().bottomLeft()))
+        if not chosen:
+            return
+        payload = chosen.data() or {}
+        template = payload.get('template') or {}
+        next_index = len(self._analyst_card_state) + 1
+        default_name = template.get('name') or f'Analyst {next_index}'
+        new_name = f'{default_name} 副本' if payload.get('recent') else default_name
+        self._create_analyst_card({
+            'name': new_name,
+            'api_url': template.get('api_url', ''),
+            'api_key': template.get('api_key', ''),
+            'model': template.get('model', ''),
+            'enabled': True,
+        })
+        self._set_header_status(f"已从模板新增 analyst：{new_name}", '#27ae60', auto_clear_ms=3000)
+        self._refresh_analysis_meta()
+
+    def _create_analyst_card(self, analyst):
+        t = self.theme_tokens
+        ff = "font-family: 'Microsoft YaHei', sans-serif;"
+        input_style = f"""
+            QLineEdit {{
+                background-color: {t['panel_alt']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 5px;
+                padding: 5px 8px;
+                font-size: 8pt; {ff}
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t['accent']};
+            }}
+        """
+        button_style = f"""
+            QPushButton {{
+                background-color: {t['surface']}; color: {t['text']};
+                border: 1px solid {t['border']}; border-radius: 5px; padding: 5px;
+                font-size: 8pt; {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """
+        label_style = f"color: {t['text']}; font-size: 7.8pt; font-weight: 600; {ff}"
+        check_box_style = f"QCheckBox {{ color: {t['text']}; font-size: 8pt; {ff} }}"
+
+        card_widget = QWidget()
+        card_widget.setObjectName('settingsCard')
+        card_widget.setStyleSheet(f"""
+            QWidget#settingsCard {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+            }}
+        """)
+        card_layout = QVBoxLayout(card_widget)
+        card_layout.setContentsMargins(10, 10, 10, 10)
+        card_layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        enabled_checkbox = QCheckBox('启用')
+        enabled_checkbox.setStyleSheet(check_box_style)
+        enabled_checkbox.setChecked(bool(analyst.get('enabled', True)))
+        header.addWidget(enabled_checkbox)
+
+        name_input = QLineEdit()
+        name_input.setStyleSheet(input_style)
+        name_input.setPlaceholderText('Analyst 名称')
+        name_input.setText(analyst.get('name', ''))
+        header.addWidget(name_input, 1)
+
+        test_btn = QPushButton('测试')
+        test_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        test_btn.setFixedWidth(72)
+        test_btn.setStyleSheet(button_style)
+        header.addWidget(test_btn)
+
+        remove_btn = QPushButton('删除')
+        remove_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        remove_btn.setFixedWidth(72)
+        remove_btn.setStyleSheet(button_style)
+        header.addWidget(remove_btn)
+        card_layout.addLayout(header)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        url_lbl = QLabel('API URL')
+        url_lbl.setStyleSheet(label_style)
+        url_input = QLineEdit()
+        url_input.setStyleSheet(input_style)
+        url_input.setPlaceholderText('https://api.minimaxi.com/anthropic')
+        url_input.setText(analyst.get('api_url', ''))
+        grid.addWidget(url_lbl, 0, 0)
+        grid.addWidget(url_input, 0, 1, 1, 3)
+
+        key_lbl = QLabel('API Key')
+        key_lbl.setStyleSheet(label_style)
+        key_input = QLineEdit()
+        key_input.setStyleSheet(input_style)
+        key_input.setEchoMode(QLineEdit.Password)
+        key_input.setPlaceholderText('sk-...')
+        key_input.setText(analyst.get('api_key', ''))
+        grid.addWidget(key_lbl, 1, 0)
+        grid.addWidget(key_input, 1, 1)
+
+        model_lbl = QLabel('Model')
+        model_lbl.setStyleSheet(label_style)
+        model_input = QLineEdit()
+        model_input.setStyleSheet(input_style)
+        model_input.setPlaceholderText('claude-sonnet-4-6')
+        model_input.setText(analyst.get('model', ''))
+        grid.addWidget(model_lbl, 1, 2)
+        grid.addWidget(model_input, 1, 3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        card_layout.addLayout(grid)
+
+        status_label = QLabel('')
+        status_label.setStyleSheet(f"color: {t['text_muted']}; font-size: 7.5pt; {ff}")
+        card_layout.addWidget(status_label)
+
+        card = {
+            'widget': card_widget,
+            'enabled_checkbox': enabled_checkbox,
+            'name_input': name_input,
+            'url_input': url_input,
+            'key_input': key_input,
+            'model_input': model_input,
+            'test_btn': test_btn,
+            'remove_btn': remove_btn,
+            'status_label': status_label,
+        }
+        self._analyst_card_state.append(card)
+        self._analysts_layout.addWidget(card_widget)
+        self._style_config_analyst_card(card)
+
+        enabled_checkbox.toggled.connect(self._refresh_analysis_meta)
+        name_input.textChanged.connect(self._refresh_analysis_meta)
+        model_input.textChanged.connect(self._refresh_analysis_meta)
+        test_btn.clicked.connect(lambda _, ref=card: self._test_connection(ref))
+        remove_btn.clicked.connect(lambda _, ref=card: self._remove_analyst_card(ref))
+
+    def _remove_analyst_card(self, card):
+        if len(self._analyst_card_state) <= 1:
+            self._set_header_status('至少保留一个 analyst 配置', '#e67e22', auto_clear_ms=3000)
+            return
+        if card in self._analyst_card_state:
+            self._analyst_card_state.remove(card)
+            card['widget'].deleteLater()
+            self._refresh_analysis_meta()
 
     def _save_current_settings(self):
         settings = self.save_settings()
@@ -1910,9 +2624,9 @@ class GoldAnalysisDialog(QDialog):
             owner.config['gold_data_settings'] = settings['gold_data_settings']
             owner._save_config()
             saved_at = datetime.datetime.now().strftime('%H:%M:%S')
-            self._set_header_status(f'已保存 {saved_at}', '#27ae60')
+            self._set_header_status(f'已保存 {saved_at}', '#27ae60', auto_clear_ms=3000)
             return
-        self._set_header_status('保存失败：未找到主窗口', '#e74c3c')
+        self._set_header_status('保存失败：未找到主窗口', '#e74c3c', auto_clear_ms=3000)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1920,34 +2634,78 @@ class GoldAnalysisDialog(QDialog):
 
     # --- 连通性测试 ---
 
-    def _test_connection(self):
-        api_url = self._url_input.text().strip()
-        api_key = self._key_input.text().strip()
-        model = self._model_input.text().strip()
-        if not api_url or not api_key or not model:
-            self._test_result_label.setText('<span style="color:#e74c3c;">请先填写完整配置</span>')
+    def _resolve_test_target(self, target):
+        if target == 'summarizer':
+            return {
+                'key': 'summarizer',
+                'api_url': self._summarizer_url_input.text().strip(),
+                'api_key': self._summarizer_key_input.text().strip(),
+                'model': self._summarizer_model_input.text().strip(),
+                'button': self._test_summarizer_btn,
+                'idle_text': '测试 summarizer',
+                'status_label': self._test_result_label,
+            }
+        if isinstance(target, dict):
+            return {
+                'key': id(target),
+                'api_url': target['url_input'].text().strip(),
+                'api_key': target['key_input'].text().strip(),
+                'model': target['model_input'].text().strip(),
+                'button': target['test_btn'],
+                'idle_text': '测试',
+                'status_label': target['status_label'],
+            }
+        return None
+
+    def _test_connection(self, target):
+        if self._test_thread is not None:
+            self._set_header_status('已有连通性测试在进行中', '#e67e22', auto_clear_ms=3000)
             return
-        self._test_btn.setText('⏳ 测试中')
-        self._test_btn.setEnabled(False)
+        resolved = self._resolve_test_target(target)
+        if not resolved:
+            return
+        if not resolved['api_url'] or not resolved['api_key'] or not resolved['model']:
+            resolved['status_label'].setText('<span style="color:#e74c3c;">请先填写完整配置</span>')
+            return
+        self._test_target_key = resolved['key']
+        resolved['button'].setText('⏳ 测试中')
+        resolved['button'].setEnabled(False)
+        resolved['status_label'].setText('')
         self._test_result_label.setText('')
-        self._test_thread = _ApiTestThread(api_url, api_key, model)
+        self._test_thread = _ApiTestThread(resolved['api_url'], resolved['api_key'], resolved['model'])
         self._test_thread.result_ready.connect(self._on_test_result)
         self._test_thread.finished.connect(self._on_test_thread_finished)
         self._test_thread.start()
 
+    def _find_test_target(self):
+        if self._test_target_key == 'summarizer':
+            return self._resolve_test_target('summarizer')
+        for card in self._analyst_card_state:
+            if id(card) == self._test_target_key:
+                return self._resolve_test_target(card)
+        return None
+
     def _on_test_result(self, success, msg):
-        self._test_btn.setText('🔗 测试连通')
-        self._test_btn.setEnabled(True)
+        target = self._find_test_target()
+        if not target:
+            return
+        target['button'].setText(target['idle_text'])
+        target['button'].setEnabled(True)
         color = '#27ae60' if success else '#e74c3c'
         icon = '✅' if success else '❌'
-        self._test_result_label.setText(f'<span style="color:{color};">{icon} {msg}</span>')
+        target['status_label'].setText(f'<span style="color:{color};">{icon} {msg}</span>')
 
     def _on_test_thread_finished(self):
+        target = self._find_test_target()
+        if target:
+            target['button'].setText(target['idle_text'])
+            target['button'].setEnabled(True)
         thread = self.sender()
         if thread is not None:
             thread.deleteLater()
         if self._test_thread is thread:
             self._test_thread = None
+        self._test_target_key = None
 
     # --- 分析逻辑 ---
 
@@ -1966,7 +2724,14 @@ class GoldAnalysisDialog(QDialog):
         self._status_message = ''
         self._error_message = ''
         self._followup_input.clear()
+        self._raw_csv_text = ''
+        self._raw_html_content = ''
+        self._set_raw_meta({})
+        self._copy_raw_csv_btn.setEnabled(False)
+        self._current_analyst_results = []
         self._render_chat_history()
+        self._render_analyst_tab()
+        self._render_raw_content()
         self._refresh_analysis_meta()
         self._update_send_button_state()
 
@@ -1991,7 +2756,115 @@ class GoldAnalysisDialog(QDialog):
                 return True
         return super().eventFilter(watched, event)
 
-    def _render_chat_history(self):
+    def _clear_analyst_reports_layout(self):
+        while self._analyst_reports_layout.count() > 1:
+            item = self._analyst_reports_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _build_analyst_card(self, item):
+        t = self.theme_tokens
+        ff = f"font-family: '{UI_FONT_FAMILY}', '{UI_FONT_FALLBACK}', sans-serif;"
+        wrapper = QWidget()
+        wrapper.setStyleSheet(f"""
+            QWidget {{
+                background-color: {t['panel']};
+                border: 1px solid {t['border_soft']};
+                border-radius: 8px;
+            }}
+        """)
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+
+        name = item.get('name') or '未命名 analyst'
+        model = item.get('model') or '未设置模型'
+        success = bool(item.get('success'))
+        status_text = '成功' if success else '失败'
+        status_color = '#27ae60' if success else '#e74c3c'
+        card_key = f"{name}::{model}"
+
+        header_btn = QPushButton()
+        header_btn.setCheckable(True)
+        header_btn.setChecked(bool(self._analyst_report_expanded.get(card_key, False)))
+        header_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        header_btn.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left;
+                background-color: {t['surface']};
+                color: {t['text_strong']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 8.4pt;
+                font-weight: 600;
+                {ff}
+            }}
+            QPushButton:hover {{
+                background-color: {t['surface_hover']};
+            }}
+        """)
+        layout.addWidget(header_btn)
+
+        meta_label = QLabel(
+            f'<span style="color:{t["text_muted"]};">{html.escape(name)}</span>'
+            f'｜<span style="color:{status_color};">{status_text}</span>'
+        )
+        meta_label.setStyleSheet(f"font-size: 7.5pt; {ff}")
+        layout.addWidget(meta_label)
+
+        body_browser = QTextBrowser()
+        body_browser.setOpenExternalLinks(False)
+        body_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {t['panel_alt']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 8.2pt;
+                {ff}
+            }}
+        """)
+        content = item.get('content') or item.get('error') or ''
+        body_html = _GoldAnalysisThread._md_to_html(content) if success else f'<p style="margin:0; color:{t["text"]};">{html.escape(content)}</p>'
+        body_browser.setHtml(body_html)
+        body_browser.setVisible(header_btn.isChecked())
+        layout.addWidget(body_browser)
+
+        def toggle_body(checked, btn=header_btn, body=body_browser, key=card_key):
+            self._analyst_report_expanded[key] = checked
+            btn.setText(f'{"▼" if checked else "▶"} {model}')
+            body.setVisible(checked)
+
+        header_btn.toggled.connect(toggle_body)
+        header_btn.setText(f'{"▼" if header_btn.isChecked() else "▶"} {model}')
+        return wrapper
+
+    def _render_analyst_tab(self):
+        analyst_results = self._current_analyst_results or []
+        self._clear_analyst_reports_layout()
+        if not analyst_results:
+            self._analyst_summary_label.setText('暂无 analyst 原始分析')
+            empty_label = QLabel('首轮分析完成后，这里会显示各 analyst 的原始报告')
+            empty_label.setAlignment(Qt.AlignCenter)
+            empty_label.setStyleSheet(
+                f"color: {self.theme_tokens['text_muted']}; font-size: 8pt; font-family: '{UI_FONT_FAMILY}', '{UI_FONT_FALLBACK}', sans-serif; padding: 32px 0;"
+            )
+            self._analyst_reports_layout.insertWidget(0, empty_label)
+            return
+
+        failed_count = sum(1 for item in analyst_results if not bool(item.get('success')))
+        summary = f'共 {len(analyst_results)} 个 analyst 报告'
+        if failed_count:
+            summary += f'，其中 {failed_count} 个失败'
+        self._analyst_summary_label.setText(summary)
+        for item in analyst_results:
+            self._analyst_reports_layout.insertWidget(self._analyst_reports_layout.count() - 1, self._build_analyst_card(item))
+
+    def _render_chat_history(self, preserve_scroll=False):
+        previous_value = self._result_browser.verticalScrollBar().value() if preserve_scroll else None
         if not self._chat_messages:
             if self._error_message:
                 self._result_browser.setHtml(self._build_result_placeholder(f'分析失败：{self._error_message}', '#e74c3c'))
@@ -2011,7 +2884,7 @@ class GoldAnalysisDialog(QDialog):
             if role == 'system':
                 continue
             if role == 'assistant':
-                title = 'AI 分析'
+                title = '汇总结果' if message.get('analyst_results') else 'AI 分析'
                 body = (
                     f'<div style="color:{self.theme_tokens["text"]}; line-height:1.68; '
                     f'font-size:8.8pt; font-family:\'{UI_FONT_FAMILY}\', \'{UI_FONT_FALLBACK}\', sans-serif;">'
@@ -2043,31 +2916,48 @@ class GoldAnalysisDialog(QDialog):
             )
 
         self._result_browser.setHtml(''.join(blocks))
-        self._result_browser.verticalScrollBar().setValue(
-            self._result_browser.verticalScrollBar().maximum()
-        )
+        if preserve_scroll and previous_value is not None:
+            self._result_browser.verticalScrollBar().setValue(previous_value)
+        else:
+            self._result_browser.verticalScrollBar().setValue(
+                self._result_browser.verticalScrollBar().maximum()
+            )
 
     def _start_analysis(self):
-        api_url = self._url_input.text().strip()
-        api_key = self._key_input.text().strip()
-        model = self._model_input.text().strip()
-        prompt_template = self._prompt_input.toPlainText().strip()
-        td_api_key = self._td_key_input.text().strip()
-        if not api_url or not api_key or not model or not td_api_key:
-            self._error_message = '请先填写完整的 API URL、API Key、TD Key 和 Model'
+        settings = self.save_settings()
+        ai_settings = settings['ai_settings']
+        td_api_key = settings['gold_data_settings'].get('twelvedata_api_key', '')
+        analysis_mode = settings['gold_data_settings'].get('analysis_mode', '24h_hourly')
+        enabled_analysts = [item for item in ai_settings.get('analysts', []) if item.get('enabled')]
+        summarizer = ai_settings.get('summarizer', {})
+        if not td_api_key:
+            self._error_message = '请先填写 TD Key'
+            self._status_message = ''
+            self._render_chat_history()
+            return
+        if not enabled_analysts:
+            self._error_message = '请至少启用一个 analyst'
+            self._status_message = ''
+            self._render_chat_history()
+            return
+        missing_analyst = next((item for item in enabled_analysts if not item.get('api_url') or not item.get('api_key') or not item.get('model')), None)
+        if missing_analyst:
+            self._error_message = f"请填写完整的 analyst 配置：{missing_analyst.get('name') or '未命名 analyst'}"
+            self._status_message = ''
+            self._render_chat_history()
+            return
+        if not summarizer.get('api_url') or not summarizer.get('api_key') or not summarizer.get('model'):
+            self._error_message = '请填写完整的 summarizer 配置'
             self._status_message = ''
             self._render_chat_history()
             return
 
-        analysis_mode = self._analysis_mode_combo.currentData() or '24h_hourly'
-
         self._reset_chat_session()
         self._request_mode = 'initial'
-        self._tabs.setCurrentIndex(1)
+        self._tabs.setCurrentIndex(0)
         self._set_request_in_progress(True)
         self._analysis_thread = _GoldAnalysisThread(
-            api_url, api_key, model,
-            prompt_template=prompt_template,
+            ai_settings=ai_settings,
             twelvedata_api_key=td_api_key,
             analysis_mode=analysis_mode,
             follow_up_mode=False,
@@ -2086,19 +2976,25 @@ class GoldAnalysisDialog(QDialog):
         if not followup_text:
             return
 
+        settings = self.save_settings()
+        ai_settings = settings['ai_settings']
+        summarizer = ai_settings.get('summarizer', {})
+        if not summarizer.get('api_url') or not summarizer.get('api_key') or not summarizer.get('model'):
+            self._error_message = '请填写完整的 summarizer 配置'
+            self._render_chat_history()
+            return
+
         self._request_mode = 'follow_up'
         self._status_message = ''
         self._error_message = ''
         self._chat_messages.append({'role': 'user', 'content': followup_text})
         self._followup_input.clear()
         self._render_chat_history()
-        self._tabs.setCurrentIndex(1)
+        self._tabs.setCurrentIndex(0)
         messages = [self._analysis_context_message] + list(self._chat_messages)
         self._set_request_in_progress(True)
         self._analysis_thread = _GoldAnalysisThread(
-            self._url_input.text().strip(),
-            self._key_input.text().strip(),
-            self._model_input.text().strip(),
+            ai_settings=ai_settings,
             messages=messages,
             follow_up_mode=True,
         )
@@ -2114,8 +3010,17 @@ class GoldAnalysisDialog(QDialog):
         self._error_message = ''
         self._render_chat_history()
 
-    def _on_raw_data(self, html_table):
-        self._raw_browser.setHtml(html_table)
+    def _on_raw_data(self, payload):
+        if isinstance(payload, dict):
+            self._raw_html_content = payload.get('html', '')
+            self._raw_csv_text = payload.get('csv', '')
+            self._set_raw_meta(payload.get('meta', {}))
+        else:
+            self._raw_html_content = payload or ''
+            self._raw_csv_text = ''
+            self._set_raw_meta({})
+        self._render_raw_content()
+        self._copy_raw_csv_btn.setEnabled(bool(self._raw_csv_text))
 
     def _on_result(self, payload):
         self._status_message = ''
@@ -2123,16 +3028,25 @@ class GoldAnalysisDialog(QDialog):
         if isinstance(payload, dict):
             text = payload.get('reply', '')
             self._latest_analysis_markdown = text
+            analyst_results = payload.get('analyst_results') or []
             if payload.get('analysis_context_message'):
                 self._analysis_context_message = payload.get('analysis_context_message')
                 self._current_kline_context = payload.get('kline_context')
                 self._chat_messages = []
-            self._chat_messages.append({'role': 'assistant', 'content': text})
+                self._current_analyst_results = analyst_results
+            message = {
+                'role': 'assistant',
+                'content': text,
+            }
+            if analyst_results:
+                message['analyst_results'] = analyst_results
+            self._chat_messages.append(message)
         else:
             self._latest_analysis_markdown = payload or ''
             self._chat_messages.append({'role': 'assistant', 'content': payload or ''})
         self._request_mode = None
         self._render_chat_history()
+        self._render_analyst_tab()
 
     def _on_error(self, err_msg):
         self._status_message = ''
@@ -2142,6 +3056,13 @@ class GoldAnalysisDialog(QDialog):
             self._followup_input.setPlainText(failed_question)
         self._request_mode = None
         self._render_chat_history()
+        self._render_analyst_tab()
+
+    def _copy_raw_csv(self):
+        if not self._raw_csv_text:
+            return
+        QApplication.clipboard().setText(self._raw_csv_text)
+        self._set_header_status('CSV 已复制', '#27ae60', auto_clear_ms=3000)
 
     def _on_analysis_thread_finished(self):
         thread = self.sender()
@@ -2193,6 +3114,7 @@ class GoldAnalysisDialog(QDialog):
         if thread is None:
             return
         self._test_thread = None
+        self._test_target_key = None
         try:
             thread.result_ready.disconnect(self._on_test_result)
         except TypeError:
@@ -2244,19 +3166,16 @@ class _ApiTestThread(QThread):
 
 
 class _GoldAnalysisThread(QThread):
-    """后台线程：抓取K线 + 计算指标 + 调用AI"""
+    """后台线程：抓取K线 + 计算指标 + analyst/summarizer 调用"""
     progress_ready = pyqtSignal(str)
-    raw_data_ready = pyqtSignal(str)
+    raw_data_ready = pyqtSignal(object)
     result_ready = pyqtSignal(object)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, api_url, api_key, model, prompt_template='', twelvedata_api_key='',
-                 messages=None, follow_up_mode=False, analysis_mode='24h_hourly'):
+    def __init__(self, ai_settings=None, twelvedata_api_key='', messages=None,
+                 follow_up_mode=False, analysis_mode='24h_hourly'):
         super().__init__()
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-        self.prompt_template = prompt_template
+        self.ai_settings = normalize_ai_settings(ai_settings)
         self.twelvedata_api_key = twelvedata_api_key
         self.messages = messages or []
         self.follow_up_mode = follow_up_mode
@@ -2264,10 +3183,14 @@ class _GoldAnalysisThread(QThread):
 
     def run(self):
         try:
+            summarizer = self.ai_settings.get('summarizer', {})
             if self.follow_up_mode:
                 self.progress_ready.emit('🤖 正在发送追问，请稍候...')
                 text = analyze_with_ai(
-                    self.api_url, self.api_key, self.model, self.messages
+                    summarizer.get('api_url', ''),
+                    summarizer.get('api_key', ''),
+                    summarizer.get('model', ''),
+                    self.messages,
                 )
                 self.result_ready.emit({'reply': text})
                 return
@@ -2287,26 +3210,79 @@ class _GoldAnalysisThread(QThread):
 
             self.progress_ready.emit('💰 获取伦敦金现货价...')
             spot_price = fetch_london_gold_spot()
-            self.raw_data_ready.emit(
-                self._build_raw_html(
-                    kline, ind, kline_source, spot_price,
+            self.raw_data_ready.emit({
+                'html': self._build_raw_html(
+                    kline, ind,
                     analysis_mode=mode_config['key'],
-                )
-            )
+                ),
+                'csv': self._build_raw_csv(kline, ind),
+                'meta': {
+                    'period_text': mode_config['period_text'],
+                    'kline_source': kline_source,
+                    'spot_price': spot_price,
+                },
+            })
 
-            self.progress_ready.emit('🤖 正在调用AI分析，请稍候...')
+            shared_prompt_template = self.ai_settings.get('shared_prompt_template', '')
             analysis_prompt = build_analysis_prompt(
-                kline, ind, self.prompt_template,
+                kline, ind, shared_prompt_template,
                 spot_price=spot_price,
                 kline_source=kline_source,
                 analysis_mode=mode_config['key'],
             )
-            analysis_context_message = {'role': 'user', 'content': analysis_prompt}
+            enabled_analysts = [item for item in self.ai_settings.get('analysts', []) if item.get('enabled')]
+            analyst_results = []
+            failed_analysts = []
+
+            for index, analyst in enumerate(enabled_analysts, start=1):
+                analyst_name = analyst.get('name') or f'Analyst {index}'
+                self.progress_ready.emit(f'🤖 正在调用 {analyst_name}...')
+                try:
+                    content = analyze_with_ai(
+                        analyst.get('api_url', ''),
+                        analyst.get('api_key', ''),
+                        analyst.get('model', ''),
+                        [{'role': 'user', 'content': analysis_prompt}],
+                    )
+                    analyst_results.append({
+                        'name': analyst_name,
+                        'model': analyst.get('model', ''),
+                        'success': True,
+                        'content': content,
+                    })
+                except Exception as exc:
+                    error_text = str(exc)
+                    result = {
+                        'name': analyst_name,
+                        'model': analyst.get('model', ''),
+                        'success': False,
+                        'error': error_text,
+                    }
+                    analyst_results.append(result)
+                    failed_analysts.append(result)
+
+            successful_results = [item for item in analyst_results if item.get('success')]
+            if not successful_results:
+                self.error_ready.emit('所有 analyst 调用均失败，无法生成汇总结果')
+                return
+
+            self.progress_ready.emit('🧠 正在汇总 analyst 观点...')
+            summarizer_prompt = build_summarizer_prompt(
+                analysis_prompt,
+                successful_results,
+                self.ai_settings.get('summarizer_prompt_template', ''),
+                failed_analysts=failed_analysts,
+            )
+            analysis_context_message = {'role': 'user', 'content': summarizer_prompt}
             text = analyze_with_ai(
-                self.api_url, self.api_key, self.model, [analysis_context_message]
+                summarizer.get('api_url', ''),
+                summarizer.get('api_key', ''),
+                summarizer.get('model', ''),
+                [analysis_context_message],
             )
             self.result_ready.emit({
                 'reply': text,
+                'analyst_results': analyst_results,
                 'analysis_context_message': analysis_context_message,
                 'kline_context': {
                     'analysis_mode': mode_config['key'],
@@ -2316,13 +3292,37 @@ class _GoldAnalysisThread(QThread):
                     'indicators': ind,
                     'spot_price': spot_price,
                     'kline_source': kline_source,
+                    'analyst_results': analyst_results,
                 },
             })
         except Exception as e:
             self.error_ready.emit(str(e))
 
     @staticmethod
-    def _build_raw_html(kline, ind, kline_source='', spot_price=0, analysis_mode='24h_hourly'):
+    def _build_raw_csv(kline, ind):
+        headers = [
+            '时间', '开盘', '最高', '最低', '收盘', '成交量', 'DIF', 'DEA', 'MACD柱', 'RSI',
+            'Boll上', 'Boll中', 'Boll下', 'K', 'D', 'J', 'ATR', 'MA5', 'MA10'
+        ]
+        lines = [','.join(headers)]
+        for candle, row in zip(kline, ind.get('series', [])):
+            values = [
+                candle['time'], candle['open'], candle['high'], candle['low'], candle['close'], candle['volume'],
+                row['macd_dif'], row['macd_dea'], row['macd_hist'], row['rsi'],
+                row['boll_upper'], row['boll_mid'], row['boll_lower'], row['kdj_k'], row['kdj_d'], row['kdj_j'],
+                row['atr'], row['ma5'], row['ma10'],
+            ]
+            escaped = []
+            for value in values:
+                text = '' if value is None else str(value)
+                if any(ch in text for ch in [',', '"', '\n']):
+                    text = '"' + text.replace('"', '""') + '"'
+                escaped.append(text)
+            lines.append(','.join(escaped))
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _build_raw_html(kline, ind, analysis_mode='24h_hourly'):
         """构建原始数据 HTML 表格"""
         mode_config = get_gold_analysis_mode_config(analysis_mode)
         rows = ''
@@ -2339,14 +3339,8 @@ class _GoldAnalysisThread(QThread):
                 f"<td>{row['atr']}</td><td>{row['ma5']}</td><td>{row['ma10']}</td></tr>"
             )
 
-        source_info = f'<p style="font-size:7.5pt;color:#5a6a7a;">分析周期: {mode_config["period_text"]}</p>'
-        source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">K线数据来源: {kline_source}</p>'
-        if spot_price > 0:
-            source_info += f'<p style="font-size:7.5pt;color:#5a6a7a;">伦敦金现货价(新浪): {spot_price} 美元/盎司</p>'
-
         return (
-            f'{source_info}'
-            f'<h4>{mode_config["raw_title"]}</h4>'
+            f'<h4 style="margin:0 0 10px 0;">{mode_config["raw_title"]}</h4>'
             '<div style="overflow:auto; max-width:100%;">'
             '<table style="width:max-content;border-collapse:collapse;font-size:7.5pt; white-space:nowrap;">'
             '<tr style="font-weight:600;border-bottom:1px solid #444;">'
@@ -2971,6 +3965,8 @@ class StockWidget(QWidget):
         self.dark_mode = not self.dark_mode
         self._init_colors()
         self._apply_theme()
+        if self._gold_analysis_dialog is not None and self._gold_analysis_dialog.isVisible():
+            self._gold_analysis_dialog.apply_theme(self.dark_mode)
         self._save_config()
 
     def _open_stock_settings(self):

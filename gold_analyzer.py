@@ -372,6 +372,9 @@ PROMPT_COMBINED_TABLE = '{{combined_table}}'
 PROMPT_INDICATORS = '{{indicators_text}}'
 PROMPT_PERIOD_TEXT = '{{period_text}}'
 PROMPT_COMBINED_TITLE = '{{combined_title}}'
+SUMMARIZER_PROMPT_ANALYSIS = '{{analysis_prompt}}'
+SUMMARIZER_PROMPT_ANALYST_OUTPUTS = '{{analyst_outputs}}'
+SUMMARIZER_PROMPT_FAILED_ANALYSTS = '{{failed_analysts}}'
 
 
 def get_default_analysis_prompt():
@@ -425,6 +428,141 @@ def normalize_prompt_template(prompt_template=''):
     if '## 指标摘要' in text and '## 合并数据（' in text:
         return text
     return get_default_analysis_prompt() + f'\n\n## 附加要求\n{text}'
+
+
+def get_default_summarizer_prompt():
+    """返回默认的汇总提示词模板。"""
+    return f"""你是一位黄金市场首席策略分析师。请基于同一份原始行情背景与多位 analyst 的分析结果，输出一份最终汇总结论。
+
+## 原始分析背景
+{SUMMARIZER_PROMPT_ANALYSIS}
+
+## 各 analyst 原始分析
+{SUMMARIZER_PROMPT_ANALYST_OUTPUTS}
+
+## analyst 调用失败情况
+{SUMMARIZER_PROMPT_FAILED_ANALYSTS}
+
+请用中文输出 Markdown 格式总结，并遵循以下要求：
+1. 先给出**最终结论**，明确短期趋势判断（多头/空头/震荡）
+2. 提炼**关键支撑位和阻力位**，尽量给出区间或具体价位
+3. 归纳 analyst 之间的**共识与分歧**
+4. 给出**可执行建议**（做多/做空/观望、关注价位、止损思路）
+5. 补充**风险提示**
+
+要求：
+- 优先基于 analyst 的共识进行总结；若存在明显分歧，要直接指出
+- 若部分 analyst 失败，只基于成功结果汇总，不要臆造失败 analyst 的观点
+- 语言简洁，强调可操作性
+- 不要输出表格"""
+
+
+def _normalize_ai_endpoint_config(config, default_name=''):
+    config = config if isinstance(config, dict) else {}
+    return {
+        'name': (config.get('name') or default_name).strip(),
+        'api_url': (config.get('api_url') or '').strip(),
+        'api_key': (config.get('api_key') or '').strip(),
+        'model': (config.get('model') or '').strip(),
+        'enabled': bool(config.get('enabled', True)),
+    }
+
+
+def normalize_ai_settings(ai_settings=None):
+    """将旧版或不完整 AI 配置归一化为 ensemble 结构。"""
+    config = ai_settings if isinstance(ai_settings, dict) else {}
+    old_api_url = (config.get('api_url') or '').strip()
+    old_api_key = (config.get('api_key') or '').strip()
+    old_model = (config.get('model') or '').strip()
+    old_prompt = config.get('prompt_template') or config.get('custom_prompt') or ''
+
+    shared_prompt_template = normalize_prompt_template(
+        config.get('shared_prompt_template') or old_prompt
+    )
+    summarizer_prompt_template = (config.get('summarizer_prompt_template') or '').strip() or get_default_summarizer_prompt()
+
+    analysts = []
+    raw_analysts = config.get('analysts')
+    if isinstance(raw_analysts, list):
+        for index, analyst in enumerate(raw_analysts, start=1):
+            normalized = _normalize_ai_endpoint_config(analyst, f'Analyst {index}')
+            if not normalized['name']:
+                normalized['name'] = f'Analyst {index}'
+            analysts.append(normalized)
+    elif old_api_url or old_api_key or old_model or old_prompt:
+        analysts.append({
+            'name': 'Analyst 1',
+            'api_url': old_api_url,
+            'api_key': old_api_key,
+            'model': old_model,
+            'enabled': True,
+        })
+    else:
+        analysts.append({
+            'name': 'Analyst 1',
+            'api_url': '',
+            'api_key': '',
+            'model': '',
+            'enabled': True,
+        })
+
+    summarizer = _normalize_ai_endpoint_config(config.get('summarizer'), 'Summarizer')
+    if not summarizer['api_url']:
+        summarizer['api_url'] = old_api_url
+    if not summarizer['api_key']:
+        summarizer['api_key'] = old_api_key
+    if not summarizer['model']:
+        summarizer['model'] = old_model
+    summarizer.pop('enabled', None)
+
+    normalized = {
+        'shared_prompt_template': shared_prompt_template,
+        'summarizer_prompt_template': summarizer_prompt_template,
+        'analysts': [],
+        'summarizer': {
+            'api_url': summarizer.get('api_url', ''),
+            'api_key': summarizer.get('api_key', ''),
+            'model': summarizer.get('model', ''),
+        },
+    }
+
+    for index, analyst in enumerate(analysts, start=1):
+        item = {
+            'name': (analyst.get('name') or f'Analyst {index}').strip() or f'Analyst {index}',
+            'api_url': (analyst.get('api_url') or '').strip(),
+            'api_key': (analyst.get('api_key') or '').strip(),
+            'model': (analyst.get('model') or '').strip(),
+            'enabled': bool(analyst.get('enabled', True)),
+        }
+        normalized['analysts'].append(item)
+
+    return normalized
+
+
+def build_summarizer_prompt(analysis_prompt, analyst_results, summarizer_prompt_template='', failed_analysts=None):
+    """构造 summarizer 用的汇总 prompt。"""
+    template = (summarizer_prompt_template or '').strip() or get_default_summarizer_prompt()
+    success_sections = []
+    for index, item in enumerate(analyst_results or [], start=1):
+        if not item.get('success'):
+            continue
+        name = item.get('name') or f'Analyst {index}'
+        model = item.get('model') or '未设置模型'
+        content = item.get('content') or ''
+        success_sections.append(f"### {name}（{model}）\n{content}")
+    analyst_outputs_text = '\n\n'.join(success_sections).strip() or '无可用 analyst 输出。'
+
+    failure_sections = []
+    for item in failed_analysts or []:
+        name = item.get('name') or '未命名 analyst'
+        error = item.get('error') or '未知错误'
+        failure_sections.append(f'- {name}: {error}')
+    failed_analysts_text = '\n'.join(failure_sections).strip() or '无'
+
+    return (template
+            .replace(SUMMARIZER_PROMPT_ANALYSIS, analysis_prompt or '')
+            .replace(SUMMARIZER_PROMPT_ANALYST_OUTPUTS, analyst_outputs_text)
+            .replace(SUMMARIZER_PROMPT_FAILED_ANALYSTS, failed_analysts_text))
 
 
 def render_prompt_template(prompt_template, source_note, combined_table, indicators_text,

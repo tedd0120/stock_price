@@ -11,6 +11,7 @@ from PyQt5.QtCore import Qt
 
 from stock_widget import StockWidget
 from stock_fetcher import map_stock_to_sina_code
+from gold_analyzer import normalize_ai_settings
 
 
 def load_config():
@@ -28,7 +29,7 @@ def load_config():
         ],
         "refresh_interval": 2,
         "opacity": 0.85,
-        "ai_settings": {},
+        "ai_settings": normalize_ai_settings({}),
         "gold_data_settings": {
             "analysis_mode": "24h_hourly"
         },
@@ -56,6 +57,7 @@ def load_config():
             if mapped_symbol not in normalized_visible:
                 normalized_visible.append(mapped_symbol)
         config["visible_stocks"] = normalized_visible
+        config["ai_settings"] = normalize_ai_settings(config.get("ai_settings", {}))
         return config
 
     if getattr(sys, 'frozen', False):
