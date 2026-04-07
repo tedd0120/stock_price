@@ -14,11 +14,11 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QComboBox, QSplitter, QGridLayout, QCheckBox
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QPoint, QRect, QPropertyAnimation,
+    Qt, QTimer, QPoint, QRect, QRectF, QPropertyAnimation,
     QEasingCurve, QParallelAnimationGroup, QEvent
 )
 from PyQt5.QtGui import (
-    QPainter, QColor, QBrush, QPen, QFont, QCursor, QIcon, QPixmap
+    QPainter, QColor, QBrush, QPen, QFont, QCursor, QIcon, QPixmap, QPainterPath
 )
 from stock_fetcher import StockFetcher, search_stocks, get_display_quote_code, _safe_float
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -1369,6 +1369,224 @@ class GoldConverterDialog(QDialog):
         self._fade_out_anim = fade_out  # prevent GC
 
 
+class GoldCandlestickChart(QWidget):
+    """轻量自绘黄金K线图。"""
+
+    def __init__(self, dark_mode=True, parent=None):
+        super().__init__(parent)
+        self.dark_mode = dark_mode
+        self.theme_tokens = get_theme_tokens(dark_mode)
+        self._chart_data = None
+        self._empty_text = '暂无数据，请先点击「开始分析」'
+        self.setMinimumHeight(240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+
+    def set_chart_data(self, chart_data=None):
+        self._chart_data = chart_data if isinstance(chart_data, dict) and chart_data.get('kline') else None
+        self.update()
+
+    def clear_chart(self, empty_text=None):
+        self._chart_data = None
+        if empty_text:
+            self._empty_text = empty_text
+        self.update()
+
+    def set_empty_text(self, text):
+        self._empty_text = text or '暂无数据'
+        if not self._chart_data:
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        tokens = self.theme_tokens
+
+        chart = self._chart_data
+        kline = (chart or {}).get('kline') or []
+        series = (chart or {}).get('series') or []
+        if not kline:
+            self._draw_empty_state(painter, rect)
+            return
+
+        title = self._build_title(chart)
+        title_rect = QRect(rect.left() + 12, rect.top() + 10, rect.width() - 24, 22)
+        painter.setPen(QColor(tokens['text_strong']))
+        painter.setFont(QFont(UI_FONT_FAMILY, 9, QFont.Bold))
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, title)
+
+        legend_rect = QRect(rect.left() + 12, rect.top() + 34, rect.width() - 24, 18)
+        self._draw_legend(painter, legend_rect)
+
+        plot_rect = QRect(rect.left() + 12, rect.top() + 58, rect.width() - 70, rect.height() - 92)
+        if plot_rect.width() <= 20 or plot_rect.height() <= 20:
+            return
+
+        min_price, max_price = self._get_price_bounds(kline, series)
+        if min_price is None or max_price is None:
+            self._draw_empty_state(painter, rect)
+            return
+
+        self._draw_grid(painter, plot_rect, min_price, max_price)
+        self._draw_price_labels(painter, plot_rect, min_price, max_price)
+        centers = self._draw_candles(painter, plot_rect, kline, min_price, max_price)
+        self._draw_ma_line(painter, plot_rect, centers, series, 'ma5', QColor('#f5c04d'), min_price, max_price)
+        self._draw_ma_line(painter, plot_rect, centers, series, 'ma10', QColor('#7cc7ff'), min_price, max_price)
+        self._draw_time_labels(painter, plot_rect, kline, centers)
+
+    def _draw_empty_state(self, painter, rect):
+        painter.setPen(QColor(self.theme_tokens['text_muted']))
+        painter.setFont(QFont(UI_FONT_FAMILY, 9))
+        painter.drawText(rect.adjusted(16, 20, -16, -20), Qt.AlignCenter | Qt.TextWordWrap, self._empty_text)
+
+    def _build_title(self, chart):
+        mode_key = chart.get('analysis_mode') or '24h_hourly'
+        mode_config = get_gold_analysis_mode_config(mode_key)
+        return f"K线走势｜{mode_config['ui_label']}"
+
+    def _draw_legend(self, painter, rect):
+        items = [
+            ('K线', QColor('#cfd6e4')),
+            ('MA5', QColor('#f5c04d')),
+            ('MA10', QColor('#7cc7ff')),
+        ]
+        x = rect.left()
+        for text, color in items:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(x, rect.center().y() - 3, 12, 6), 3, 3)
+            x += 18
+            painter.setPen(QColor('#9fb4cf'))
+            painter.setFont(QFont(UI_FONT_FAMILY, 8))
+            painter.drawText(QRect(x, rect.top(), 44, rect.height()), Qt.AlignLeft | Qt.AlignVCenter, text)
+            x += 52
+
+    def _get_price_bounds(self, kline, series):
+        values = []
+        for candle in kline:
+            for key in ('high', 'low'):
+                value = candle.get(key)
+                if isinstance(value, (int, float)):
+                    values.append(float(value))
+        for row in series:
+            for key in ('ma5', 'ma10'):
+                value = row.get(key)
+                if isinstance(value, (int, float)):
+                    values.append(float(value))
+        if not values:
+            return None, None
+        min_price = min(values)
+        max_price = max(values)
+        if max_price == min_price:
+            padding = max(abs(max_price) * 0.01, 1.0)
+        else:
+            padding = (max_price - min_price) * 0.08
+        return min_price - padding, max_price + padding
+
+    def _price_to_y(self, price, plot_rect, min_price, max_price):
+        if max_price <= min_price:
+            return plot_rect.center().y()
+        ratio = (price - min_price) / (max_price - min_price)
+        return plot_rect.bottom() - ratio * plot_rect.height()
+
+    def _draw_grid(self, painter, plot_rect, min_price, max_price):
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor('#d7e6ff'), 1, Qt.DashLine))
+        steps = 4
+        for idx in range(steps + 1):
+            y = plot_rect.top() + (plot_rect.height() * idx / steps)
+            painter.drawLine(plot_rect.left(), int(y), plot_rect.right(), int(y))
+        painter.setPen(QPen(QColor('#8fbaf0'), 1))
+        painter.drawRect(plot_rect)
+
+    def _draw_price_labels(self, painter, plot_rect, min_price, max_price):
+        painter.setPen(QColor('#d8ecff'))
+        painter.setFont(QFont(MONO_FONT_FAMILY, 7))
+        steps = 4
+        label_left = plot_rect.right() + 6
+        for idx in range(steps + 1):
+            value = max_price - (max_price - min_price) * idx / steps
+            y = plot_rect.top() + (plot_rect.height() * idx / steps)
+            label_rect = QRect(label_left, int(y) - 8, 52, 16)
+            painter.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, f'{value:.2f}')
+
+    def _draw_candles(self, painter, plot_rect, kline, min_price, max_price):
+        count = len(kline)
+        if count <= 0:
+            return []
+        step = plot_rect.width() / max(count, 1)
+        body_width = max(3.0, min(12.0, step * 0.55))
+        rise = QColor('#ff6b4a')
+        fall = QColor('#22c55e')
+        centers = []
+        for index, candle in enumerate(kline):
+            center_x = plot_rect.left() + step * index + step / 2
+            centers.append(center_x)
+            open_price = float(candle.get('open', 0))
+            close_price = float(candle.get('close', 0))
+            high_price = float(candle.get('high', 0))
+            low_price = float(candle.get('low', 0))
+            color = rise if close_price >= open_price else fall
+            wick_pen = QPen(color, 1)
+            painter.setPen(wick_pen)
+            high_y = self._price_to_y(high_price, plot_rect, min_price, max_price)
+            low_y = self._price_to_y(low_price, plot_rect, min_price, max_price)
+            painter.drawLine(QPoint(int(center_x), int(high_y)), QPoint(int(center_x), int(low_y)))
+
+            open_y = self._price_to_y(open_price, plot_rect, min_price, max_price)
+            close_y = self._price_to_y(close_price, plot_rect, min_price, max_price)
+            top = min(open_y, close_y)
+            height = max(abs(close_y - open_y), 1.5)
+            body_rect = QRectF(center_x - body_width / 2, top, body_width, height)
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(color if close_price >= open_price else Qt.NoBrush)
+            painter.drawRect(body_rect)
+        return centers
+
+    def _draw_ma_line(self, painter, plot_rect, centers, series, key, color, min_price, max_price):
+        if not centers or not series:
+            return
+        path = QPainterPath()
+        started = False
+        for center_x, row in zip(centers, series):
+            value = row.get(key)
+            if not isinstance(value, (int, float)):
+                started = False
+                continue
+            y = self._price_to_y(float(value), plot_rect, min_price, max_price)
+            if not started:
+                path.moveTo(center_x, y)
+                started = True
+            else:
+                path.lineTo(center_x, y)
+        painter.setPen(QPen(color, 1.6))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+
+    def _draw_time_labels(self, painter, plot_rect, kline, centers):
+        if not centers:
+            return
+        painter.setPen(QColor('#d8ecff'))
+        painter.setFont(QFont(UI_FONT_FAMILY, 7))
+        count = len(kline)
+        target_ticks = min(4, count)
+        indexes = []
+        if count == 1:
+            indexes = [0]
+        else:
+            for tick in range(target_ticks):
+                idx = round((count - 1) * tick / max(target_ticks - 1, 1))
+                if idx not in indexes:
+                    indexes.append(idx)
+        for idx in indexes:
+            x = centers[idx]
+            label = str(kline[idx].get('time', ''))
+            label_rect = QRect(int(x - 34), plot_rect.bottom() + 6, 68, 16)
+            painter.drawText(label_rect, Qt.AlignHCenter | Qt.AlignTop, label)
+
+
 class GoldAnalysisDialog(QDialog):
     """金价AI分析对话框"""
 
@@ -1402,7 +1620,9 @@ class GoldAnalysisDialog(QDialog):
         }
         self._settings_sections = {}
         self._raw_html_content = ''
+        self._raw_csv_text = ''
         self._raw_meta = {}
+        self._raw_chart_data = None
 
         self.setWindowTitle('金价AI分析')
         self.setWindowFlags(
@@ -1709,11 +1929,15 @@ class GoldAnalysisDialog(QDialog):
         raw_meta_layout.addLayout(raw_meta_grid)
         raw_layout.addWidget(self._raw_meta_card)
 
+        self._raw_chart = GoldCandlestickChart(dark_mode=self.dark_mode)
+        self._raw_chart.setMinimumHeight(250)
+        raw_layout.addWidget(self._raw_chart)
+
         self._raw_browser = QTextBrowser()
         self._raw_browser.setOpenExternalLinks(False)
         raw_layout.addWidget(self._raw_browser, 1)
-        self._raw_csv_text = ''
         self._set_raw_meta({})
+        self._update_raw_chart()
         self._render_raw_content()
         self._raw_meta_card.setVisible(False)
         self._tabs.addTab(self._raw_tab, '📋 原始数据')
@@ -2223,6 +2447,7 @@ class GoldAnalysisDialog(QDialog):
         self._raw_meta_source_label.setStyleSheet(label_style)
         self._raw_meta_price_label.setStyleSheet(label_style)
         self._copy_raw_csv_btn.setStyleSheet(button_style)
+        self._raw_chart.setStyleSheet('background: transparent;')
         self._raw_browser.setStyleSheet(browser_style.replace('font-size: 8.2pt;', 'font-size: 7.5pt;'))
 
         self._settings_tab.setStyleSheet(f"background-color: {t['panel_alt']};")
@@ -2318,6 +2543,12 @@ class GoldAnalysisDialog(QDialog):
         self._raw_meta_source_label.setText(f'K线来源：{source_text}')
         self._raw_meta_price_label.setText(f'伦敦金现货价：{price_text}')
         self._raw_meta_card.setVisible(bool(self._raw_meta))
+
+    def _update_raw_chart(self):
+        if self._raw_chart_data:
+            self._raw_chart.set_chart_data(self._raw_chart_data)
+        else:
+            self._raw_chart.clear_chart('暂无数据，请先点击「开始分析」')
 
     def _render_raw_content(self):
         if self._raw_html_content:
@@ -2726,7 +2957,9 @@ class GoldAnalysisDialog(QDialog):
         self._followup_input.clear()
         self._raw_csv_text = ''
         self._raw_html_content = ''
+        self._raw_chart_data = None
         self._set_raw_meta({})
+        self._update_raw_chart()
         self._copy_raw_csv_btn.setEnabled(False)
         self._current_analyst_results = []
         self._render_chat_history()
@@ -3014,11 +3247,14 @@ class GoldAnalysisDialog(QDialog):
         if isinstance(payload, dict):
             self._raw_html_content = payload.get('html', '')
             self._raw_csv_text = payload.get('csv', '')
+            self._raw_chart_data = payload.get('chart') if isinstance(payload.get('chart'), dict) else None
             self._set_raw_meta(payload.get('meta', {}))
         else:
             self._raw_html_content = payload or ''
             self._raw_csv_text = ''
+            self._raw_chart_data = None
             self._set_raw_meta({})
+        self._update_raw_chart()
         self._render_raw_content()
         self._copy_raw_csv_btn.setEnabled(bool(self._raw_csv_text))
 
@@ -3051,6 +3287,10 @@ class GoldAnalysisDialog(QDialog):
     def _on_error(self, err_msg):
         self._status_message = ''
         self._error_message = err_msg
+        if self._request_mode == 'initial' and not self._raw_html_content:
+            self._raw_chart_data = None
+            self._set_raw_meta({})
+            self._update_raw_chart()
         if self._request_mode == 'follow_up' and self._chat_messages and self._chat_messages[-1].get('role') == 'user':
             failed_question = self._chat_messages.pop().get('content', '')
             self._followup_input.setPlainText(failed_question)
@@ -3220,6 +3460,11 @@ class _GoldAnalysisThread(QThread):
                     'period_text': mode_config['period_text'],
                     'kline_source': kline_source,
                     'spot_price': spot_price,
+                },
+                'chart': {
+                    'analysis_mode': mode_config['key'],
+                    'kline': kline,
+                    'series': ind.get('series', []),
                 },
             })
 
